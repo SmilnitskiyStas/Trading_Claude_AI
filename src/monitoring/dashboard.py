@@ -9,11 +9,12 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 import uvicorn
 
-from src.utils.config import DASHBOARD_HOST, DASHBOARD_PORT
+from src.utils.config import ANTHROPIC_API_KEY, DASHBOARD_HOST, DASHBOARD_PORT
 from src.utils.logger import logger
 
 if TYPE_CHECKING:
     from src.trading.paper_trader import PaperTrader
+    from src.ai_agent.agent import TradingAgent
 
 
 class ConnectionManager:
@@ -43,7 +44,10 @@ class ConnectionManager:
 _manager = ConnectionManager()
 
 
-def create_app(trader: "PaperTrader | None" = None) -> FastAPI:
+def create_app(
+    trader: "PaperTrader | None" = None,
+    agent: "TradingAgent | None" = None,
+) -> FastAPI:
     app = FastAPI(title="Trading Dashboard", docs_url=None, redoc_url=None)
 
     # ── REST endpoints ─────────────────────────────────────────────────────
@@ -58,7 +62,7 @@ def create_app(trader: "PaperTrader | None" = None) -> FastAPI:
 
     @app.get("/api/status")
     async def api_status() -> dict:
-        return _build_status(trader)
+        return _build_status(trader, agent)
 
     @app.get("/api/trades")
     async def api_trades() -> dict:
@@ -86,6 +90,33 @@ def create_app(trader: "PaperTrader | None" = None) -> FastAPI:
             return {"curve": []}
         return {"curve": trader.equity_curve[-200:]}
 
+    # ── AI Agent toggle ────────────────────────────────────────────────────
+
+    @app.get("/api/agent")
+    async def api_agent_status() -> dict:
+        api_key_set = bool(ANTHROPIC_API_KEY and ANTHROPIC_API_KEY not in ("your_key", ""))
+        return {
+            "available":   agent is not None,
+            "enabled":     agent.enabled if agent else False,
+            "api_key_set": api_key_set,
+        }
+
+    @app.post("/api/agent/enable")
+    async def api_agent_enable() -> dict:
+        if agent is None:
+            return {"ok": False, "error": "Agent not initialized (check ANTHROPIC_API_KEY in .env)"}
+        agent.enabled = True
+        logger.info("AI agent ENABLED via dashboard")
+        return {"ok": True, "enabled": True}
+
+    @app.post("/api/agent/disable")
+    async def api_agent_disable() -> dict:
+        if agent is None:
+            return {"ok": False, "error": "Agent not available"}
+        agent.enabled = False
+        logger.info("AI agent DISABLED via dashboard")
+        return {"ok": True, "enabled": False}
+
     # ── WebSocket ──────────────────────────────────────────────────────────
 
     @app.websocket("/ws")
@@ -101,25 +132,36 @@ def create_app(trader: "PaperTrader | None" = None) -> FastAPI:
 
     @app.on_event("startup")
     async def _start_broadcaster() -> None:
-        asyncio.create_task(_broadcast_loop(trader))
+        asyncio.create_task(_broadcast_loop(trader, agent))
 
     return app
 
 
-async def _broadcast_loop(trader: "PaperTrader | None", interval: int = 5) -> None:
+async def _broadcast_loop(
+    trader: "PaperTrader | None",
+    agent: "TradingAgent | None" = None,
+    interval: int = 5,
+) -> None:
     while True:
         try:
-            data = _build_status(trader)
+            data = _build_status(trader, agent)
             await _manager.broadcast(data)
         except Exception as exc:
             logger.debug(f"broadcast error: {exc}")
         await asyncio.sleep(interval)
 
 
-def _build_status(trader: "PaperTrader | None") -> dict:
+def _build_status(
+    trader: "PaperTrader | None",
+    agent: "TradingAgent | None" = None,
+) -> dict:
     ts = datetime.now(timezone.utc).isoformat()
     if trader is None:
-        return {"ts": ts, "equity": 0, "positions": [], "halted": False}
+        return {
+            "ts": ts, "equity": 0, "positions": [], "halted": False,
+            "agent_available": agent is not None,
+            "agent_enabled":   agent.enabled if agent else False,
+        }
 
     rm = trader.rm
     s = rm.summary()
@@ -140,21 +182,26 @@ def _build_status(trader: "PaperTrader | None") -> dict:
     ]
 
     return {
-        "ts":             ts,
-        "equity":         s["equity"],
-        "peak_equity":    s["peak_equity"],
-        "drawdown":       round(s["drawdown"] * 100, 2),
-        "daily_pnl":      s["daily_pnl"],
-        "open_positions": s["open_positions"],
-        "total_exposure": s["total_exposure"],
-        "halted":         s["halted"],
-        "total_trades":   len(trader.closed_trades),
-        "positions":      positions,
+        "ts":              ts,
+        "equity":          s["equity"],
+        "peak_equity":     s["peak_equity"],
+        "drawdown":        round(s["drawdown"] * 100, 2),
+        "daily_pnl":       s["daily_pnl"],
+        "open_positions":  s["open_positions"],
+        "total_exposure":  s["total_exposure"],
+        "halted":          s["halted"],
+        "total_trades":    len(trader.closed_trades),
+        "positions":       positions,
+        "agent_available": agent is not None,
+        "agent_enabled":   agent.enabled if agent else False,
     }
 
 
-async def run_dashboard(trader: "PaperTrader | None" = None) -> None:
-    app = create_app(trader)
+async def run_dashboard(
+    trader: "PaperTrader | None" = None,
+    agent: "TradingAgent | None" = None,
+) -> None:
+    app = create_app(trader, agent)
     config = uvicorn.Config(
         app,
         host=DASHBOARD_HOST,
@@ -178,37 +225,77 @@ _HTML = """<!DOCTYPE html>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { font-family: 'Segoe UI', monospace; background: #0d1117; color: #c9d1d9; min-height: 100vh; }
-  header { background: #161b22; padding: 16px 24px; border-bottom: 1px solid #30363d;
-           display: flex; align-items: center; gap: 12px; }
-  header h1 { font-size: 1.2rem; font-weight: 600; }
-  .badge { padding: 3px 8px; border-radius: 12px; font-size: .75rem; font-weight: 600; }
-  .badge-paper { background: #1f6feb; color: #fff; }
+  header { background: #161b22; padding: 14px 24px; border-bottom: 1px solid #30363d;
+           display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  header h1 { font-size: 1.15rem; font-weight: 600; }
+  .badge { padding: 3px 8px; border-radius: 12px; font-size: .72rem; font-weight: 600; }
+  .badge-paper  { background: #1f6feb; color: #fff; }
   .badge-halted { background: #da3633; color: #fff; }
-  .badge-ok { background: #238636; color: #fff; }
-  #ts { margin-left: auto; font-size: .75rem; color: #8b949e; }
-  main { padding: 24px; display: grid; gap: 20px; max-width: 1200px; margin: 0 auto; }
-  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; }
-  .card { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 16px; }
-  .card label { font-size: .7rem; color: #8b949e; text-transform: uppercase; letter-spacing: .05em; display: block; margin-bottom: 6px; }
-  .card .val { font-size: 1.4rem; font-weight: 700; }
-  .green { color: #3fb950; } .red { color: #f85149; } .yellow { color: #d29922; }
-  table { width: 100%; border-collapse: collapse; font-size: .85rem; }
+  #ts { margin-left: auto; font-size: .72rem; color: #8b949e; }
+  main { padding: 20px 24px; display: grid; gap: 20px; max-width: 1200px; margin: 0 auto; }
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; }
+  .card { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 14px 16px; }
+  .card label { font-size: .68rem; color: #8b949e; text-transform: uppercase;
+                letter-spacing: .05em; display: block; margin-bottom: 5px; }
+  .card .val { font-size: 1.35rem; font-weight: 700; }
+  .green  { color: #3fb950; }
+  .red    { color: #f85149; }
+  .yellow { color: #d29922; }
+  .gray   { color: #8b949e; }
+
+  /* ── Agent panel ──────────────────────────────────────────── */
+  .agent-panel {
+    background: #161b22; border: 1px solid #30363d; border-radius: 8px;
+    padding: 16px 20px; display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+  }
+  .agent-panel .agent-info { flex: 1; min-width: 200px; }
+  .agent-panel .agent-title {
+    font-size: .85rem; font-weight: 600; margin-bottom: 4px; display: flex;
+    align-items: center; gap: 8px;
+  }
+  .agent-panel .agent-desc { font-size: .75rem; color: #8b949e; line-height: 1.4; }
+  .agent-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; flex-shrink: 0; }
+  .dot-on   { background: #3fb950; box-shadow: 0 0 6px #3fb950; }
+  .dot-off  { background: #8b949e; }
+  .dot-na   { background: #da3633; }
+
+  /* Toggle switch */
+  .toggle-wrap { display: flex; align-items: center; gap: 10px; }
+  .toggle-label { font-size: .78rem; color: #8b949e; min-width: 55px; }
+  .switch { position: relative; display: inline-block; width: 46px; height: 24px; }
+  .switch input { opacity: 0; width: 0; height: 0; }
+  .slider {
+    position: absolute; cursor: pointer; inset: 0;
+    background: #30363d; border-radius: 24px; transition: .25s;
+  }
+  .slider:before {
+    position: absolute; content: ""; height: 18px; width: 18px;
+    left: 3px; bottom: 3px; background: #fff; border-radius: 50%; transition: .25s;
+  }
+  input:checked + .slider { background: #1f6feb; }
+  input:checked + .slider:before { transform: translateX(22px); }
+  input:disabled + .slider { opacity: .4; cursor: not-allowed; }
+  .toggle-status { font-size: .78rem; font-weight: 600; min-width: 60px; }
+
+  /* ── Tables ───────────────────────────────────────────────── */
+  table { width: 100%; border-collapse: collapse; font-size: .83rem; }
   th { text-align: left; padding: 8px 12px; background: #161b22;
        color: #8b949e; font-weight: 500; border-bottom: 1px solid #30363d; }
   td { padding: 7px 12px; border-bottom: 1px solid #21262d; }
   tr:hover td { background: #161b22; }
-  .section-title { font-size: .9rem; font-weight: 600; color: #8b949e; margin-bottom: 10px; }
-  canvas { max-height: 200px; }
+  .section-title { font-size: .88rem; font-weight: 600; color: #8b949e; margin-bottom: 10px; }
 </style>
 </head>
 <body>
 <header>
   <h1>&#x1F4C8; Trading Dashboard</h1>
   <span class="badge badge-paper">PAPER</span>
-  <span id="halt-badge" class="badge badge-ok" style="display:none">HALTED</span>
+  <span id="halt-badge" class="badge" style="display:none;background:#da3633;color:#fff">&#x26D4; HALTED</span>
   <span id="ts"></span>
 </header>
 <main>
+
+  <!-- Portfolio cards -->
   <div class="cards">
     <div class="card"><label>Equity (USDT)</label><div class="val" id="equity">—</div></div>
     <div class="card"><label>Drawdown</label><div class="val" id="dd">—</div></div>
@@ -218,79 +305,167 @@ _HTML = """<!DOCTYPE html>
     <div class="card"><label>Exposure (USDT)</label><div class="val" id="exposure">—</div></div>
   </div>
 
+  <!-- AI Agent control panel -->
+  <div class="agent-panel">
+    <div class="agent-info">
+      <div class="agent-title">
+        <span class="agent-dot dot-na" id="agent-dot"></span>
+        &#x1F916; AI Agent (Claude)
+      </div>
+      <div class="agent-desc" id="agent-desc">
+        Analyzes ML signals + news sentiment once per hour. Results cached in Redis.
+        When enabled, Claude confirms or overrides ML signals before trade opens.
+      </div>
+    </div>
+    <div class="toggle-wrap">
+      <span class="toggle-label" id="agent-label">N/A</span>
+      <label class="switch">
+        <input type="checkbox" id="agent-toggle" disabled onchange="toggleAgent(this.checked)">
+        <span class="slider"></span>
+      </label>
+      <span class="toggle-status gray" id="agent-status-text">—</span>
+    </div>
+  </div>
+
+  <!-- Open positions -->
   <div>
     <div class="section-title">Open Positions</div>
-    <table id="pos-table">
+    <table>
       <thead><tr>
-        <th>Symbol</th><th>Side</th><th>Entry</th><th>Size</th>
+        <th>Symbol</th><th>Side</th><th>Entry</th><th>Size USDT</th>
         <th>Stop Loss</th><th>Take Profit</th><th>Held</th>
       </tr></thead>
-      <tbody id="pos-body"><tr><td colspan="7" style="color:#8b949e;padding:16px">No open positions</td></tr></tbody>
+      <tbody id="pos-body">
+        <tr><td colspan="7" style="color:#8b949e;padding:16px">No open positions</td></tr>
+      </tbody>
     </table>
   </div>
 
+  <!-- Recent trades -->
   <div>
     <div class="section-title">Recent Trades</div>
-    <table id="trades-table">
+    <table>
       <thead><tr>
         <th>Symbol</th><th>Side</th><th>Entry</th><th>Exit</th>
-        <th>PnL USDT</th><th>PnL %</th><th>Reason</th><th>Time</th>
+        <th>PnL USDT</th><th>PnL %</th><th>Reason</th><th>Closed</th>
       </tr></thead>
-      <tbody id="trades-body"><tr><td colspan="8" style="color:#8b949e;padding:16px">Loading...</td></tr></tbody>
+      <tbody id="trades-body">
+        <tr><td colspan="8" style="color:#8b949e;padding:16px">Loading...</td></tr>
+      </tbody>
     </table>
   </div>
-</main>
 
+</main>
 <script>
 const fmt = (n, d=2) => n == null ? '—' : n.toLocaleString('en-US', {minimumFractionDigits:d, maximumFractionDigits:d});
-const pct = n => n == null ? '—' : (n >= 0 ? '+' : '') + fmt(n) + '%';
-const cls = n => n >= 0 ? 'green' : 'red';
+const cls  = n => n >= 0 ? 'green' : 'red';
 
+// ── Portfolio status ───────────────────────────────────────────────────────
 function applyStatus(d) {
   document.getElementById('ts').textContent = new Date(d.ts).toLocaleTimeString();
   document.getElementById('equity').textContent = fmt(d.equity);
+
   const ddEl = document.getElementById('dd');
-  ddEl.textContent = pct(d.drawdown);
-  ddEl.className = 'val ' + (d.drawdown > 5 ? 'red' : d.drawdown > 2 ? 'yellow' : 'green');
+  const ddVal = d.drawdown ?? 0;
+  ddEl.textContent = (ddVal >= 0 ? '+' : '') + fmt(ddVal) + '%';
+  ddEl.className = 'val ' + (ddVal > 5 ? 'red' : ddVal > 2 ? 'yellow' : 'green');
+
   const dpEl = document.getElementById('daily-pnl');
-  dpEl.textContent = (d.daily_pnl >= 0 ? '+' : '') + fmt(d.daily_pnl);
-  dpEl.className = 'val ' + cls(d.daily_pnl);
-  document.getElementById('n-pos').textContent = d.open_positions;
-  document.getElementById('n-trades').textContent = d.total_trades;
+  const dp = d.daily_pnl ?? 0;
+  dpEl.textContent = (dp >= 0 ? '+' : '') + fmt(dp);
+  dpEl.className = 'val ' + cls(dp);
+
+  document.getElementById('n-pos').textContent    = d.open_positions ?? '—';
+  document.getElementById('n-trades').textContent = d.total_trades   ?? '—';
   document.getElementById('exposure').textContent = fmt(d.total_exposure);
-  const hb = document.getElementById('halt-badge');
-  hb.style.display = d.halted ? 'inline' : 'none';
+  document.getElementById('halt-badge').style.display = d.halted ? 'inline' : 'none';
 
   // Positions table
   const pb = document.getElementById('pos-body');
   if (!d.positions || d.positions.length === 0) {
-    pb.innerHTML = '<tr><td colspan="7" style="color:#8b949e;padding:16px">No open positions</td></tr>';
+    pb.innerHTML = '<tr><td colspan="7" style="color:#8b949e;padding:14px">No open positions</td></tr>';
   } else {
     pb.innerHTML = d.positions.map(p => `<tr>
       <td><b>${p.symbol}</b></td>
       <td style="color:${p.direction==='LONG'?'#3fb950':'#f85149'}">${p.direction}</td>
       <td>${fmt(p.entry_price, 4)}</td>
-      <td>${fmt(p.notional, 2)}</td>
+      <td>${fmt(p.notional)}</td>
       <td>${fmt(p.stop_loss, 4)}</td>
       <td>${fmt(p.take_profit, 4)}</td>
       <td>${p.held_hours}h</td>
     </tr>`).join('');
   }
+
+  // AI Agent panel
+  applyAgentStatus(d.agent_available, d.agent_enabled);
 }
 
+// ── AI Agent panel ─────────────────────────────────────────────────────────
+function applyAgentStatus(available, enabled) {
+  const dot   = document.getElementById('agent-dot');
+  const label = document.getElementById('agent-label');
+  const tog   = document.getElementById('agent-toggle');
+  const txt   = document.getElementById('agent-status-text');
+
+  if (!available) {
+    dot.className   = 'agent-dot dot-na';
+    label.textContent = 'No API key';
+    tog.disabled    = true;
+    tog.checked     = false;
+    txt.textContent = 'Unavailable';
+    txt.className   = 'toggle-status gray';
+    document.getElementById('agent-desc').textContent =
+      'Set ANTHROPIC_API_KEY in .env and restart to enable the AI Agent.';
+  } else if (enabled) {
+    dot.className   = 'agent-dot dot-on';
+    label.textContent = 'Enabled';
+    tog.disabled    = false;
+    tog.checked     = true;
+    txt.textContent = 'Active';
+    txt.className   = 'toggle-status green';
+  } else {
+    dot.className   = 'agent-dot dot-off';
+    label.textContent = 'Disabled';
+    tog.disabled    = false;
+    tog.checked     = false;
+    txt.textContent = 'Paused';
+    txt.className   = 'toggle-status yellow';
+  }
+}
+
+async function toggleAgent(enable) {
+  const endpoint = enable ? '/api/agent/enable' : '/api/agent/disable';
+  try {
+    const r = await fetch(endpoint, { method: 'POST' });
+    const d = await r.json();
+    if (!d.ok) {
+      alert('Agent toggle failed: ' + (d.error || 'unknown error'));
+      // Revert toggle visually
+      document.getElementById('agent-toggle').checked = !enable;
+    } else {
+      applyAgentStatus(true, d.enabled);
+    }
+  } catch(e) {
+    alert('Request failed: ' + e);
+    document.getElementById('agent-toggle').checked = !enable;
+  }
+}
+
+// ── Recent trades ──────────────────────────────────────────────────────────
 async function loadTrades() {
   try {
     const r = await fetch('/api/trades');
     const d = await r.json();
     const tb = document.getElementById('trades-body');
     if (!d.trades || d.trades.length === 0) {
-      tb.innerHTML = '<tr><td colspan="8" style="color:#8b949e;padding:16px">No trades yet</td></tr>';
+      tb.innerHTML = '<tr><td colspan="8" style="color:#8b949e;padding:14px">No closed trades yet</td></tr>';
       return;
     }
     tb.innerHTML = d.trades.map(t => {
       const sign = t.pnl_usd >= 0 ? '+' : '';
-      const c = t.pnl_usd >= 0 ? 'green' : 'red';
-      const dt = new Date(t.exit_time).toLocaleString('en-US',{month:'short',day:'2-digit',hour:'2-digit',minute:'2-digit'});
+      const c    = t.pnl_usd >= 0 ? 'green' : 'red';
+      const dt   = new Date(t.exit_time).toLocaleString('en-US',
+                     {month:'short', day:'2-digit', hour:'2-digit', minute:'2-digit'});
       return `<tr>
         <td><b>${t.symbol}</b></td>
         <td style="color:${t.direction==='LONG'?'#3fb950':'#f85149'}">${t.direction}</td>
@@ -298,26 +473,23 @@ async function loadTrades() {
         <td>${fmt(t.exit_price, 4)}</td>
         <td class="${c}">${sign}${fmt(t.pnl_usd)}</td>
         <td class="${c}">${sign}${fmt(t.pnl_pct)}%</td>
-        <td><span style="font-size:.75rem;color:#8b949e">${t.reason}</span></td>
-        <td style="font-size:.75rem;color:#8b949e">${dt}</td>
+        <td style="font-size:.72rem;color:#8b949e">${t.reason}</td>
+        <td style="font-size:.72rem;color:#8b949e">${dt}</td>
       </tr>`;
     }).join('');
   } catch(e) { console.error(e); }
 }
 
-// WebSocket live updates
+// ── WebSocket ──────────────────────────────────────────────────────────────
 function connect() {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
   const ws = new WebSocket(`${proto}://${location.host}/ws`);
-  ws.onmessage = e => {
-    try { applyStatus(JSON.parse(e.data)); } catch(_) {}
-  };
-  ws.onclose = () => setTimeout(connect, 3000);
-  // Ping every 20s to keep alive
+  ws.onmessage = e => { try { applyStatus(JSON.parse(e.data)); } catch(_) {} };
+  ws.onclose   = () => setTimeout(connect, 3000);
   setInterval(() => { if (ws.readyState === 1) ws.send('ping'); }, 20000);
 }
 
-// Initial load
+// ── Init ───────────────────────────────────────────────────────────────────
 fetch('/api/status').then(r => r.json()).then(applyStatus).catch(console.error);
 loadTrades();
 setInterval(loadTrades, 15000);

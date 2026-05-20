@@ -185,11 +185,13 @@ class PaperTrader:
                     logger.debug(f"{sym}: ml={sig['action']} conf={sig['confidence']:.3f}")
 
                 # Ask agent (uses Redis cache — actual Claude call happens once/hour)
-                if agent:
+                if agent and agent.enabled:
                     try:
                         _agent_signals = await agent.analyze(ml_signals, symbols=active)
                     except Exception as exc:
                         logger.warning(f"Agent error: {exc}")
+                elif agent and not agent.enabled:
+                    _agent_signals = {}   # clear overrides when disabled
 
                 for sym in active:
                     if self.rm.is_halted:

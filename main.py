@@ -159,7 +159,7 @@ async def mode_paper_trade() -> None:
 async def mode_dashboard() -> None:
     from src.monitoring.dashboard import run_dashboard
     logger.info("Dashboard mode starting...")
-    await run_dashboard(trader=None)
+    await run_dashboard(trader=None, agent=None)
 
 
 async def mode_all() -> None:
@@ -195,7 +195,7 @@ async def mode_all() -> None:
     try:
         await asyncio.gather(
             trader.run_live(bot=bot, agent=agent),
-            run_dashboard(trader=trader),
+            run_dashboard(trader=trader, agent=agent),
         )
     finally:
         if bot:

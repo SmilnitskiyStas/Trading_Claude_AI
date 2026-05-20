@@ -44,6 +44,7 @@ class TradingAgent:
     Calls Claude API once per hour to get high-level trading direction
     per symbol, incorporating ML signals + news sentiment.
     Results are cached in Redis for 1 hour.
+    Can be enabled/disabled at runtime via the dashboard toggle.
     """
 
     def __init__(self, trader: "PaperTrader | None" = None) -> None:
@@ -53,6 +54,7 @@ class TradingAgent:
         self._fetcher = NewsFetcher(lookback_hours=4)
         self._analyzer = NewsAnalyzer()
         self._trader = trader
+        self.enabled: bool = True   # can be toggled via dashboard
 
     # ── Main entry point ───────────────────────────────────────────────────
 
