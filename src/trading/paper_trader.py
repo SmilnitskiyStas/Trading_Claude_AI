@@ -427,7 +427,7 @@ class PaperTrader:
             positions_val = sum(p.notional_usd for p in self._positions.values())
             async with get_session() as session:
                 snap = PortfolioSnapshot(
-                    timestamp=datetime.now(timezone.utc),
+                    timestamp=datetime.utcnow(),
                     total_value=self.equity,
                     cash_balance=self._cash,
                     positions_value=positions_val,

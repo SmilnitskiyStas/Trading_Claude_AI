@@ -18,9 +18,6 @@ from src.utils.logger import logger
 if TYPE_CHECKING:
     from src.trading.paper_trader import PaperTrader
 
-_CACHE_KEY = "agent:analysis"
-_CACHE_TTL = 3600   # 1 hour — same as AGENT_CALL_INTERVAL_SECONDS
-
 
 _SYSTEM_PROMPT = """\
 You are an expert crypto trading analyst.
@@ -81,10 +78,10 @@ class TradingAgent:
 
         # Try cache first
         if not force_refresh and cache.available:
-            cached = await cache.get(_CACHE_KEY)
+            cached = await cache.get_agent_analysis()
             if cached:
                 logger.debug("Agent: returning cached analysis")
-                return json.loads(cached)
+                return cached
 
         # Fetch fresh news + sentiment
         news_items = await self._fetcher.fetch_all(active_symbols)
@@ -103,7 +100,7 @@ class TradingAgent:
 
         # Cache for 1 hour
         if cache.available:
-            await cache.set(_CACHE_KEY, json.dumps(decisions), ttl=_CACHE_TTL)
+            await cache.set_agent_analysis(decisions)
 
         # Persist to DB
         await self._save_predictions(decisions, ml_signals)
@@ -234,7 +231,7 @@ class TradingAgent:
         signal_map = {"buy": 1, "hold": 0, "sell": -1}
         try:
             async with get_session() as session:
-                ts = datetime.now(timezone.utc)
+                ts = datetime.utcnow()
                 for sym, dec in decisions.items():
                     ml_sig = ml_signals.get(sym, {})
                     pred = MLPrediction(
