@@ -10,7 +10,8 @@ from src.ai_agent.news_analyzer import NewsAnalyzer
 from src.ai_agent.news_fetcher import NewsFetcher
 from src.utils.cache import cache
 from src.utils.config import (
-    AGENT_MODEL, ANTHROPIC_API_KEY, SYMBOLS,
+    AGENT_MODEL, AGENT_PROVIDER, ANTHROPIC_API_KEY,
+    OPENAI_API_KEY, OPENAI_MODEL, SYMBOLS,
 )
 from src.utils.logger import logger
 
@@ -48,9 +49,15 @@ class TradingAgent:
     """
 
     def __init__(self, trader: "PaperTrader | None" = None) -> None:
-        if not ANTHROPIC_API_KEY or ANTHROPIC_API_KEY in ("your_key", ""):
-            raise ValueError("ANTHROPIC_API_KEY is not set in .env")
-        self._client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+        # Determine which provider to use (anthropic takes priority if both keys set)
+        if ANTHROPIC_API_KEY and ANTHROPIC_API_KEY not in ("your_key", "your_anthropic_key", ""):
+            self._provider = "anthropic"
+            self._client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+        elif OPENAI_API_KEY and OPENAI_API_KEY not in ("your_openai_key", ""):
+            self._provider = "openai"
+            self._client = None  # lazy-init openai client per call
+        else:
+            raise ValueError("Neither ANTHROPIC_API_KEY nor OPENAI_API_KEY is set in .env")
         self._fetcher = NewsFetcher(lookback_hours=4)
         self._analyzer = NewsAnalyzer()
         self._trader = trader
@@ -90,8 +97,8 @@ class TradingAgent:
             active_symbols, ml_signals, sentiment_by_symbol, portfolio, news_items[:10]
         )
 
-        logger.info(f"Agent: calling Claude {AGENT_MODEL} ...")
-        response_text = await self._call_claude(user_content)
+        logger.info(f"Agent: calling {self._provider} ...")
+        response_text = await self._call_llm(user_content)
         decisions = self._parse_response(response_text, active_symbols)
 
         # Cache for 1 hour
@@ -104,7 +111,12 @@ class TradingAgent:
         logger.info(f"Agent decisions: {decisions}")
         return decisions
 
-    # ── Claude call ────────────────────────────────────────────────────────
+    # ── LLM dispatch ───────────────────────────────────────────────────────
+
+    async def _call_llm(self, user_content: str) -> str:
+        if self._provider == "openai":
+            return await self._call_openai(user_content)
+        return await self._call_claude(user_content)
 
     async def _call_claude(self, user_content: str) -> str:
         try:
@@ -117,6 +129,23 @@ class TradingAgent:
             return message.content[0].text
         except Exception as exc:
             logger.error(f"Claude API error: {exc}")
+            return "{}"
+
+    async def _call_openai(self, user_content: str) -> str:
+        try:
+            from openai import AsyncOpenAI
+            client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+            response = await client.chat.completions.create(
+                model=OPENAI_MODEL,
+                max_tokens=1024,
+                messages=[
+                    {"role": "system", "content": _SYSTEM_PROMPT},
+                    {"role": "user",   "content": user_content},
+                ],
+            )
+            return response.choices[0].message.content
+        except Exception as exc:
+            logger.error(f"OpenAI API error: {exc}")
             return "{}"
 
     # ── Helpers ────────────────────────────────────────────────────────────

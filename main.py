@@ -125,7 +125,7 @@ async def mode_paper_trade() -> None:
     from src.trading.paper_trader import PaperTrader
     from src.utils.database import check_connection, init_db
     from src.utils.cache import cache
-    from src.utils.config import TELEGRAM_BOT_TOKEN, ANTHROPIC_API_KEY
+    from src.utils.config import TELEGRAM_BOT_TOKEN, ANTHROPIC_API_KEY, OPENAI_API_KEY
 
     logger.info("Paper trading mode starting...")
     db_ok = await check_connection()
@@ -144,9 +144,14 @@ async def mode_paper_trade() -> None:
         await bot.start()
 
     agent: TradingAgent | None = None
-    if ANTHROPIC_API_KEY and ANTHROPIC_API_KEY != "your_key":
-        agent = TradingAgent(trader)
-        logger.info("AI agent enabled")
+    _has_ai_key = (ANTHROPIC_API_KEY not in ("", "your_key", "your_anthropic_key") or
+                   OPENAI_API_KEY not in ("", "your_openai_key"))
+    if _has_ai_key:
+        try:
+            agent = TradingAgent(trader)
+            logger.info(f"AI agent enabled (provider: {agent._provider})")
+        except ValueError as e:
+            logger.warning(f"AI agent disabled: {e}")
 
     try:
         await trader.run_live(bot=bot, agent=agent)
@@ -170,7 +175,7 @@ async def mode_all() -> None:
     from src.trading.paper_trader import PaperTrader
     from src.utils.database import check_connection, init_db
     from src.utils.cache import cache
-    from src.utils.config import TELEGRAM_BOT_TOKEN, ANTHROPIC_API_KEY
+    from src.utils.config import TELEGRAM_BOT_TOKEN, ANTHROPIC_API_KEY, OPENAI_API_KEY
 
     db_ok = await check_connection()
     if not db_ok:
@@ -188,9 +193,14 @@ async def mode_all() -> None:
         await bot.start()
 
     agent: TradingAgent | None = None
-    if ANTHROPIC_API_KEY and ANTHROPIC_API_KEY != "your_key":
-        agent = TradingAgent(trader)
-        logger.info("AI agent enabled")
+    _has_ai_key = (ANTHROPIC_API_KEY not in ("", "your_key", "your_anthropic_key") or
+                   OPENAI_API_KEY not in ("", "your_openai_key"))
+    if _has_ai_key:
+        try:
+            agent = TradingAgent(trader)
+            logger.info(f"AI agent enabled (provider: {agent._provider})")
+        except ValueError as e:
+            logger.warning(f"AI agent disabled: {e}")
 
     try:
         await asyncio.gather(

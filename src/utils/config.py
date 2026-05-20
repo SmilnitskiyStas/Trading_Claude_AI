@@ -83,7 +83,11 @@ MAX_DAILY_LOSS: float = float(_get("MAX_DAILY_LOSS", "0.05"))
 # ── AI Agent ───────────────────────────────────────────────────────────────
 
 ANTHROPIC_API_KEY: str = _get("ANTHROPIC_API_KEY", "")
+OPENAI_API_KEY: str = _get("OPENAI_API_KEY", "")
+# "anthropic" or "openai" — whichever key is set; anthropic takes priority
+AGENT_PROVIDER: str = _get("AGENT_PROVIDER", "anthropic")
 AGENT_MODEL: str = "claude-sonnet-4-6"
+OPENAI_MODEL: str = _get("OPENAI_MODEL", "gpt-4o-mini")
 AGENT_CALL_INTERVAL_SECONDS: int = 3600
 
 # ── News ───────────────────────────────────────────────────────────────────
