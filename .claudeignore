@@ -1,0 +1,14 @@
+data/
+logs/
+notebooks/
+__pycache__/
+.venv/
+*.pyc
+*.pkl
+*.h5
+*.csv
+*.parquet
+*.log
+*.db
+*.sqlite
+dump.rdb

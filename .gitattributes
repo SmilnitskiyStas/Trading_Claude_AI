@@ -1,0 +1,11 @@
+# Normalize line endings
+* text=auto
+
+# Force LF for shell scripts (needed on Linux server)
+*.sh text eol=lf
+deploy.sh text eol=lf
+
+# Binary files — no conversion
+*.pkl binary
+*.h5 binary
+*.parquet binary

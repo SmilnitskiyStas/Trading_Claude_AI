@@ -1,0 +1,37 @@
+# Environment
+.env
+.venv/
+venv/
+
+# Data & Models
+data/raw/
+data/processed/
+# data/models/ is tracked — model file is only 1.5 MB
+*.h5
+*.parquet
+
+# Logs & DB
+logs/
+*.log
+*.db
+*.sqlite
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+
+# Jupyter
+notebooks/.ipynb_checkpoints/
+*.ipynb
+
+# Docker
+dump.rdb
+
+# IDE
+.vscode/
+.idea/

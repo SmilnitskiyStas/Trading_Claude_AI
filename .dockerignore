@@ -1,0 +1,14 @@
+data/raw/
+data/processed/
+logs/
+notebooks/
+.venv/
+__pycache__/
+*.pyc
+*.parquet
+*.csv
+.git/
+.env
+*.log
+tests/
+deploy.sh
