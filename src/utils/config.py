@@ -92,7 +92,7 @@ AGENT_CALL_INTERVAL_SECONDS: int = 3600
 
 # ── News ───────────────────────────────────────────────────────────────────
 
-CRYPTOPANIC_API_KEY: str = _get("CRYPTOPANIC_API_KEY", "")
+NEWSDATA_API_KEY: str = _get("NEWSDATA_API_KEY", "")
 
 # ── Telegram ───────────────────────────────────────────────────────────────
 

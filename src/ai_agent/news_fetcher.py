@@ -8,7 +8,7 @@ from typing import Optional
 import aiohttp
 import feedparser
 
-from src.utils.config import CRYPTOPANIC_API_KEY
+from src.utils.config import NEWSDATA_API_KEY
 from src.utils.logger import logger
 
 # RSS feeds — no API key required
@@ -19,8 +19,13 @@ _RSS_FEEDS: dict[str, str] = {
     "bitcoinmagazine": "https://bitcoinmagazine.com/feed",
 }
 
-# CryptoPanic filter → only important/bullish/bearish
-_CRYPTOPANIC_URL = "https://cryptopanic.com/api/v1/posts/"
+# newsdata.io — free tier: 200 credits/day, 10 articles/credit
+_NEWSDATA_URL = "https://newsdata.io/api/1/latest"
+# Combined query saves credits (1 call covers all symbols)
+_NEWSDATA_QUERY = (
+    "bitcoin OR ethereum OR solana OR bnb OR xrp OR "
+    "dogecoin OR cardano OR avalanche OR tron OR chainlink"
+)
 
 # Map symbol to search keywords
 _SYMBOL_KEYWORDS: dict[str, list[str]] = {
@@ -49,8 +54,9 @@ class NewsItem:
 
 class NewsFetcher:
     """
-    Fetches crypto news from CryptoPanic API and RSS feeds.
+    Fetches crypto news from newsdata.io API and RSS feeds.
     Returns a list of NewsItem objects for the last N hours.
+    Free tier: 200 credits/day (10 articles/credit) — one call per agent run.
     """
 
     def __init__(self, lookback_hours: int = 4) -> None:
@@ -59,8 +65,8 @@ class NewsFetcher:
     async def fetch_all(self, symbols: list[str] | None = None) -> list[NewsItem]:
         """Fetch news from all sources concurrently."""
         tasks = [self._fetch_rss()]
-        if CRYPTOPANIC_API_KEY and CRYPTOPANIC_API_KEY not in ("your_key", ""):
-            tasks.append(self._fetch_cryptopanic())
+        if NEWSDATA_API_KEY and NEWSDATA_API_KEY not in ("your_key", ""):
+            tasks.append(self._fetch_newsdata())
 
         results = await asyncio.gather(*tasks, return_exceptions=True)
         items: list[NewsItem] = []
@@ -86,40 +92,47 @@ class NewsFetcher:
         logger.info(f"Fetched {len(unique)} news items ({len(tasks)} sources)")
         return unique
 
-    # ── CryptoPanic ────────────────────────────────────────────────────────
+    # ── newsdata.io ────────────────────────────────────────────────────────
 
-    async def _fetch_cryptopanic(self) -> list[NewsItem]:
+    async def _fetch_newsdata(self) -> list[NewsItem]:
+        """One API call covers all symbols — saves free-tier credits."""
         items: list[NewsItem] = []
         params = {
-            "auth_token": CRYPTOPANIC_API_KEY,
-            "public":     "true",
-            "kind":       "news",
-            "filter":     "important",
+            "apikey":    NEWSDATA_API_KEY,
+            "q":         _NEWSDATA_QUERY,
+            "language":  "en",
+            "category":  "technology,business",
         }
         try:
             async with aiohttp.ClientSession(
                 timeout=aiohttp.ClientTimeout(total=10)
             ) as session:
-                async with session.get(_CRYPTOPANIC_URL, params=params) as resp:
+                async with session.get(_NEWSDATA_URL, params=params) as resp:
                     if resp.status != 200:
-                        logger.warning(f"CryptoPanic HTTP {resp.status}")
+                        logger.warning(f"newsdata.io HTTP {resp.status}")
                         return items
                     data = await resp.json()
 
+            if data.get("status") != "success":
+                logger.warning(f"newsdata.io error: {data.get('results', {})}")
+                return items
+
             cutoff = self._cutoff()
-            for post in data.get("results", []):
-                dt = self._parse_dt(post.get("published_at", ""))
+            for article in data.get("results", []):
+                dt = self._parse_dt(article.get("pubDate", ""))
                 if dt and dt < cutoff:
                     continue
+                description = article.get("description") or ""
                 items.append(NewsItem(
-                    title=post.get("title", ""),
-                    source="cryptopanic",
-                    url=post.get("url", ""),
+                    title=article.get("title", ""),
+                    source=article.get("source_id", "newsdata"),
+                    url=article.get("link", ""),
                     published_at=dt or datetime.now(timezone.utc),
                     symbols=[],
+                    raw_text=description[:500],
                 ))
         except Exception as exc:
-            logger.warning(f"CryptoPanic fetch failed: {exc}")
+            logger.warning(f"newsdata.io fetch failed: {exc}")
         return items
 
     # ── RSS ────────────────────────────────────────────────────────────────
