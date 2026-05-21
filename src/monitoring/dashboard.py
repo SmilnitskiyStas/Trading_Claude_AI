@@ -83,7 +83,8 @@ def create_app(
                 "pnl_pct":     round(t.pnl_pct * 100, 2),
                 "entry_time":  t.entry_time.isoformat(),
                 "exit_time":   t.exit_time.isoformat(),
-                "reason":      t.exit_reason,
+                "reason":        t.exit_reason,
+                "holding_hours": round(t.holding_hours, 1),
             }
             for t in reversed(trader.closed_trades[-50:])
         ]
@@ -94,6 +95,61 @@ def create_app(
         if trader is None:
             return {"curve": []}
         return {"curve": trader.equity_curve[-200:]}
+
+    @app.get("/api/stats")
+    async def api_stats() -> dict:
+        """Comprehensive performance stats: overall + per-symbol + equity curve from DB."""
+        overall: dict = {}
+        by_symbol: list = []
+        eq_curve: list = []
+
+        if trader is not None:
+            closed = trader.closed_trades
+            total  = len(closed)
+            wins   = [t for t in closed if t.pnl_usd > 0]
+            losses = [t for t in closed if t.pnl_usd <= 0]
+            gross_win  = sum(t.pnl_usd for t in wins)
+            gross_loss = abs(sum(t.pnl_usd for t in losses))
+            overall = {
+                "total_trades":  total,
+                "win_rate":      round(len(wins) / total * 100, 1) if total else 0.0,
+                "total_pnl":     round(sum(t.pnl_usd for t in closed), 2),
+                "profit_factor": round(gross_win / gross_loss, 2) if gross_loss else 0.0,
+                "avg_hold_h":    round(sum(t.holding_hours for t in closed) / total, 1) if total else 0.0,
+            }
+            # Per-symbol breakdown sorted by total PnL
+            for sym in sorted(set(t.symbol for t in closed)):
+                st = [t for t in closed if t.symbol == sym]
+                sw = [t for t in st if t.pnl_usd > 0]
+                by_symbol.append({
+                    "symbol":   sym,
+                    "trades":   len(st),
+                    "wins":     len(sw),
+                    "losses":   len(st) - len(sw),
+                    "pnl_usd":  round(sum(t.pnl_usd for t in st), 2),
+                    "win_rate": round(len(sw) / len(st) * 100, 1) if st else 0.0,
+                    "avg_hold": round(sum(t.holding_hours for t in st) / len(st), 1) if st else 0.0,
+                })
+            by_symbol.sort(key=lambda x: x["pnl_usd"], reverse=True)
+
+        # Equity curve from DB (works in both backtest and live mode)
+        try:
+            from src.utils.database import AsyncSessionFactory
+            async with AsyncSessionFactory() as session:
+                rows = (await session.execute(text("""
+                    SELECT timestamp, total_value
+                    FROM portfolio_snapshots
+                    ORDER BY timestamp DESC LIMIT 400
+                """))).fetchall()
+                eq_curve = [
+                    {"ts": r[0].isoformat() if hasattr(r[0], "isoformat") else str(r[0]),
+                     "equity": float(r[1])}
+                    for r in reversed(rows)
+                ]
+        except Exception:
+            pass
+
+        return {"overall": overall, "by_symbol": by_symbol, "equity_curve": eq_curve}
 
     # ── OHLCV upload ──────────────────────────────────────────────────────
 
@@ -374,6 +430,11 @@ _HTML = """<!DOCTYPE html>
   .stats-item .si-sym  { font-weight: 600; color: #c9d1d9; }
   .stats-item .si-info { color: #8b949e; margin-top: 2px; }
 
+  /* ── Chart ───────────────────────────────────────────────── */
+  .chart-panel { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 16px 20px; }
+  .chart-wrap  { background: #0d1117; border: 1px solid #21262d; border-radius: 6px;
+                 padding: 6px 8px; overflow: hidden; margin-top: 10px; }
+
   /* ── Tables ───────────────────────────────────────────────── */
   table { width: 100%; border-collapse: collapse; font-size: .83rem; }
   th { text-align: left; padding: 8px 12px; background: #161b22;
@@ -400,6 +461,14 @@ _HTML = """<!DOCTYPE html>
     <div class="card"><label>Open Positions</label><div class="val" id="n-pos">—</div></div>
     <div class="card"><label>Total Trades</label><div class="val" id="n-trades">—</div></div>
     <div class="card"><label>Exposure (USDT)</label><div class="val" id="exposure">—</div></div>
+  </div>
+
+  <!-- Performance stat cards -->
+  <div class="cards">
+    <div class="card"><label>Win Rate</label><div class="val" id="win-rate">—</div></div>
+    <div class="card"><label>Total PnL (USDT)</label><div class="val" id="total-pnl">—</div></div>
+    <div class="card"><label>Profit Factor</label><div class="val" id="profit-factor">—</div></div>
+    <div class="card"><label>Avg Hold (hours)</label><div class="val gray" id="avg-hold">—</div></div>
   </div>
 
   <!-- AI Agent control panel -->
@@ -451,6 +520,47 @@ docker cp trading_postgres:/tmp/ohlcv.csv ohlcv.csv</code>
     <div id="db-stats-wrap"></div>
   </div>
 
+  <!-- Equity Curve Chart -->
+  <div class="chart-panel">
+    <div class="section-title">&#x1F4C8; Equity Curve</div>
+    <div class="chart-wrap">
+      <svg id="equity-chart" viewBox="0 0 800 140" preserveAspectRatio="none"
+           style="width:100%;height:140px;display:block">
+        <defs>
+          <linearGradient id="eq-grad" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stop-color="#1f6feb" stop-opacity="0.25"/>
+            <stop offset="100%" stop-color="#1f6feb" stop-opacity="0"/>
+          </linearGradient>
+        </defs>
+        <path id="eq-fill" d="" fill="url(#eq-grad)"/>
+        <polyline id="eq-line" points="" fill="none" stroke="#1f6feb" stroke-width="1.5" stroke-linejoin="round"/>
+        <line id="eq-baseline" x1="0" y1="70" x2="800" y2="70"
+              stroke="#30363d" stroke-width="1" stroke-dasharray="3,4"/>
+        <text id="eq-empty" x="400" y="76" text-anchor="middle"
+              fill="#8b949e" font-size="11" font-family="monospace">
+          Waiting for data — portfolio snapshots appear here after first save
+        </text>
+      </svg>
+    </div>
+    <div id="chart-labels"
+         style="display:flex;justify-content:space-between;font-size:.68rem;color:#8b949e;margin-top:4px;padding:0 4px">
+    </div>
+  </div>
+
+  <!-- Per-symbol performance -->
+  <div>
+    <div class="section-title">&#x1F3AF; Performance by Symbol</div>
+    <table>
+      <thead><tr>
+        <th>Symbol</th><th>Trades</th><th>Win Rate</th>
+        <th>Total PnL</th><th>Wins</th><th>Losses</th><th>Avg Hold</th>
+      </tr></thead>
+      <tbody id="sym-body">
+        <tr><td colspan="7" style="color:#8b949e;padding:14px">No closed trades yet</td></tr>
+      </tbody>
+    </table>
+  </div>
+
   <!-- Open positions -->
   <div>
     <div class="section-title">Open Positions</div>
@@ -471,10 +581,10 @@ docker cp trading_postgres:/tmp/ohlcv.csv ohlcv.csv</code>
     <table>
       <thead><tr>
         <th>Symbol</th><th>Side</th><th>Entry</th><th>Exit</th>
-        <th>PnL USDT</th><th>PnL %</th><th>Reason</th><th>Closed</th>
+        <th>PnL USDT</th><th>PnL %</th><th>Hold</th><th>Reason</th><th>Closed</th>
       </tr></thead>
       <tbody id="trades-body">
-        <tr><td colspan="8" style="color:#8b949e;padding:16px">Loading...</td></tr>
+        <tr><td colspan="9" style="color:#8b949e;padding:16px">Loading...</td></tr>
       </tbody>
     </table>
   </div>
@@ -652,6 +762,87 @@ async function loadDbStats() {
   } catch(e) {}
 }
 
+// ── Stats & equity chart ──────────────────────────────────────────────────
+async function loadStats() {
+  try {
+    const r = await fetch('/api/stats');
+    const d = await r.json();
+    const o = d.overall || {};
+
+    // Performance cards
+    setStatCard('win-rate',      o.win_rate,      v => fmt(v,1)+'%',  v => v >= 50 ? 'green' : 'red');
+    setStatCard('total-pnl',     o.total_pnl,     v => (v>=0?'+':'')+fmt(v), v => v >= 0 ? 'green' : 'red');
+    setStatCard('profit-factor', o.profit_factor, v => fmt(v,2),      v => v >= 1  ? 'green' : 'red');
+    if (o.avg_hold_h != null) {
+      const el = document.getElementById('avg-hold');
+      if (el) { el.textContent = fmt(o.avg_hold_h,1)+'h'; el.className = 'val gray'; }
+    }
+
+    // Equity chart
+    if (d.equity_curve && d.equity_curve.length > 1) drawEquityChart(d.equity_curve);
+
+    // Per-symbol table
+    const sb = document.getElementById('sym-body');
+    if (!sb) return;
+    if (!d.by_symbol || d.by_symbol.length === 0) return;
+    sb.innerHTML = d.by_symbol.map(s => {
+      const c = s.pnl_usd >= 0 ? 'green' : 'red';
+      const sign = s.pnl_usd >= 0 ? '+' : '';
+      return `<tr>
+        <td><b>${s.symbol}</b></td>
+        <td>${s.trades}</td>
+        <td class="${s.win_rate >= 50 ? 'green' : 'red'}">${fmt(s.win_rate,1)}%</td>
+        <td class="${c}">${sign}${fmt(s.pnl_usd)}</td>
+        <td class="green">${s.wins}</td>
+        <td class="red">${s.losses}</td>
+        <td style="color:#8b949e">${fmt(s.avg_hold,1)}h</td>
+      </tr>`;
+    }).join('');
+  } catch(e) { console.error('stats error:', e); }
+}
+
+function setStatCard(id, val, display, colorFn) {
+  const el = document.getElementById(id);
+  if (!el || val == null) return;
+  el.textContent = display(val);
+  el.className   = 'val ' + colorFn(val);
+}
+
+function drawEquityChart(points) {
+  if (!points || points.length < 2) return;
+  const W = 800, H = 140, pad = 8;
+  const vals = points.map(p => p.equity);
+  const mn = Math.min(...vals), mx = Math.max(...vals);
+  const range = mx - mn || 1;
+  const toX = i  => pad + (i / (points.length - 1)) * (W - 2 * pad);
+  const toY = v  => pad + (1 - (v - mn) / range) * (H - 2 * pad);
+
+  const ptStr = points.map((p,i) => `${toX(i).toFixed(1)},${toY(p.equity).toFixed(1)}`).join(' ');
+  const fx = toX(0), lx = toX(points.length - 1);
+  const fillD = `M${fx},${H} L${fx},${toY(points[0].equity).toFixed(1)} ` +
+    points.map((p,i) => `L${toX(i).toFixed(1)},${toY(p.equity).toFixed(1)}`).join(' ') +
+    ` L${lx},${H} Z`;
+
+  document.getElementById('eq-line').setAttribute('points', ptStr);
+  document.getElementById('eq-fill').setAttribute('d', fillD);
+  const empty = document.getElementById('eq-empty');
+  if (empty) empty.style.display = 'none';
+
+  // Baseline at initial equity value
+  const baseY = toY(points[0].equity).toFixed(1);
+  const bl = document.getElementById('eq-baseline');
+  if (bl) { bl.setAttribute('y1', baseY); bl.setAttribute('y2', baseY); }
+
+  // Date labels (first / mid / last)
+  const labels = document.getElementById('chart-labels');
+  if (labels && points.length >= 2) {
+    const d2 = dt => new Date(dt).toLocaleDateString('en-US',{month:'short',day:'2-digit'});
+    const mid = points[Math.floor(points.length / 2)];
+    labels.innerHTML =
+      `<span>${d2(points[0].ts)}</span><span>${d2(mid.ts)}</span><span>${d2(points[points.length-1].ts)}</span>`;
+  }
+}
+
 // ── Recent trades ──────────────────────────────────────────────────────────
 async function loadTrades() {
   try {
@@ -659,7 +850,7 @@ async function loadTrades() {
     const d = await r.json();
     const tb = document.getElementById('trades-body');
     if (!d.trades || d.trades.length === 0) {
-      tb.innerHTML = '<tr><td colspan="8" style="color:#8b949e;padding:14px">No closed trades yet</td></tr>';
+      tb.innerHTML = '<tr><td colspan="9" style="color:#8b949e;padding:14px">No closed trades yet</td></tr>';
       return;
     }
     tb.innerHTML = d.trades.map(t => {
@@ -674,6 +865,7 @@ async function loadTrades() {
         <td>${fmt(t.exit_price, 4)}</td>
         <td class="${c}">${sign}${fmt(t.pnl_usd)}</td>
         <td class="${c}">${sign}${fmt(t.pnl_pct)}%</td>
+        <td style="font-size:.72rem;color:#8b949e">${t.holding_hours ?? '—'}h</td>
         <td style="font-size:.72rem;color:#8b949e">${t.reason}</td>
         <td style="font-size:.72rem;color:#8b949e">${dt}</td>
       </tr>`;
@@ -693,8 +885,10 @@ function connect() {
 // ── Init ───────────────────────────────────────────────────────────────────
 fetch('/api/status').then(r => r.json()).then(applyStatus).catch(console.error);
 loadTrades();
+loadStats();
 loadDbStats();
-setInterval(loadTrades, 15000);
+setInterval(loadTrades,  15000);   // trades table every 15s
+setInterval(loadStats,   30000);   // stats + chart every 30s
 connect();
 </script>
 </body>
