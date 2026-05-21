@@ -34,6 +34,7 @@ class Position:
     take_profit: float
     entry_time: datetime
     entry_fee: float
+    best_price: float = 0.0     # trailing SL: high-watermark (long) or low-watermark (short)
 
 
 @dataclass
@@ -197,11 +198,13 @@ class PaperTrader:
                     _agent_signals = {}   # clear overrides when disabled
 
                 for sym in active:
+                    # Always check SL/TP on existing positions (even when halted)
+                    if sym in self._positions:
+                        await self._check_live_sl_tp(sym, bot=bot)
+                        continue
                     if self.rm.is_halted:
                         logger.warning("Risk manager halted — skipping new signals")
                         break
-                    if sym in self._positions:
-                        continue
 
                     # Merge: agent overrides ML only when it disagrees with "hold"
                     final_sig = dict(ml_signals[sym])
@@ -275,15 +278,21 @@ class PaperTrader:
             take_profit=sizing.take_profit_price,
             entry_time=ts,
             entry_fee=fee,
+            best_price=entry_price,
         )
         self._positions[sym] = pos
         self.rm.register_open(sym, sizing.position_size_usd)
 
     def _check_sl_tp(
-        self, sym: str, pos: Position, row: pd.Series, ts: datetime
+        self, sym: str, pos: Position, row: pd.Series, ts: datetime,
+        bot: "TelegramBot | None" = None,
     ) -> bool:
         high = float(row["high"])
         low  = float(row["low"])
+
+        # Safety: initialise best_price if position was opened before trailing-SL feature
+        if pos.best_price == 0.0:
+            pos.best_price = pos.entry_price
 
         hit_sl = hit_tp = False
         if pos.direction > 0:  # long
@@ -294,12 +303,35 @@ class PaperTrader:
             hit_tp = low  <= pos.take_profit
 
         if hit_tp:
-            self._close_position(sym, pos.take_profit, ts, "take_profit")
+            self._close_position(sym, pos.take_profit, ts, "take_profit", bot=bot)
             return True
         if hit_sl:
-            self._close_position(sym, pos.stop_loss, ts, "stop_loss")
+            self._close_position(sym, pos.stop_loss, ts, "stop_loss", bot=bot)
             return True
+
+        # Position still open — ratchet trailing stop for next bar
+        self._update_trailing_stop(sym, pos, high, low)
         return False
+
+    def _update_trailing_stop(
+        self, sym: str, pos: Position, high: float, low: float
+    ) -> None:
+        """Move stop-loss toward current price as the trade moves in our favour."""
+        trail_pct = self.rm.stop_loss
+        if pos.direction > 0:          # long: trail below high watermark
+            if high > pos.best_price:
+                pos.best_price = high
+                new_sl = round(pos.best_price * (1 - trail_pct), 8)
+                if new_sl > pos.stop_loss:
+                    pos.stop_loss = new_sl
+                    logger.debug(f"Trailing SL {sym} → {pos.stop_loss:.4f}")
+        else:                          # short: trail above low watermark
+            if low < pos.best_price:
+                pos.best_price = low
+                new_sl = round(pos.best_price * (1 + trail_pct), 8)
+                if new_sl < pos.stop_loss:
+                    pos.stop_loss = new_sl
+                    logger.debug(f"Trailing SL {sym} → {pos.stop_loss:.4f}")
 
     def _close_position(
         self,
@@ -382,6 +414,7 @@ class PaperTrader:
             take_profit=sizing.take_profit_price,
             entry_time=datetime.now(timezone.utc),
             entry_fee=fee,
+            best_price=entry_price,
         )
         self._positions[sym] = pos
         self.rm.register_open(sym, sizing.position_size_usd)
@@ -398,6 +431,30 @@ class PaperTrader:
                 sizing.stop_loss_price,
                 sizing.take_profit_price,
             )
+
+    # ── Live SL/TP check ──────────────────────────────────────────────────
+
+    async def _check_live_sl_tp(
+        self, sym: str, bot: "TelegramBot | None" = None
+    ) -> None:
+        """
+        Load the latest closed candle and check stop-loss / take-profit
+        for an open live position. Called every poll cycle.
+        """
+        if sym not in self._positions:
+            return
+        try:
+            from src.data_pipeline.aggregator import DataAggregator
+            agg = DataAggregator()
+            df = await agg.load_ohlcv(self.exchange, sym, "1h", limit=2)
+            if df.empty:
+                return
+            row = df.iloc[-1]
+            ts  = datetime.now(timezone.utc)
+            pos = self._positions[sym]
+            self._check_sl_tp(sym, pos, row, ts, bot=bot)
+        except Exception as exc:
+            logger.warning(f"Live SL/TP check failed for {sym}: {exc}")
 
     # ── Background OHLCV refresh ───────────────────────────────────────────
 

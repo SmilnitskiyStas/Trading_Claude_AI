@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING
 
 from telegram import Update, BotCommand
@@ -67,6 +67,7 @@ class TelegramBot:
         a.add_handler(CommandHandler("trades",    self._cmd_trades))
         a.add_handler(CommandHandler("metrics",   self._cmd_metrics))
         a.add_handler(CommandHandler("stop",      self._cmd_stop))
+        a.add_handler(CommandHandler("report",    self._cmd_report))
 
     # ── Lifecycle ──────────────────────────────────────────────────────────
 
@@ -79,10 +80,12 @@ class TelegramBot:
             BotCommand("positions", "Open positions"),
             BotCommand("trades",    "Last 10 closed trades"),
             BotCommand("metrics",   "Full performance metrics"),
+            BotCommand("report",    "Daily performance summary"),
             BotCommand("stop",      "Stop the trading system"),
         ])
         await self._app.start()
         await self._app.updater.start_polling(drop_pending_updates=True)
+        asyncio.create_task(self._daily_report_loop())
         logger.info("Telegram bot started — polling")
         await self.send_message("*Trading bot started* ✅\nPaper trading mode active\\.")
 
@@ -278,6 +281,78 @@ class TelegramBot:
             f"Avg win/loss: `{m.avg_win_pct:+.2%}` / `{m.avg_loss_pct:+.2%}`"
         )
         await update.message.reply_text(_clean_md(text), parse_mode=ParseMode.MARKDOWN_V2)
+
+    # ── Daily report ───────────────────────────────────────────────────────
+
+    async def send_daily_report(self) -> None:
+        """Send a daily performance summary."""
+        if self._trader is None:
+            return
+
+        from src.utils.config import INITIAL_BALANCE
+
+        rm  = self._trader.rm
+        s   = rm.summary()
+        equity    = s["equity"]
+        daily_pnl = s["daily_pnl"]
+        drawdown  = s["drawdown"]
+        n_pos     = s["open_positions"]
+
+        total_return = (equity - INITIAL_BALANCE) / INITIAL_BALANCE if INITIAL_BALANCE > 0 else 0.0
+        total_sign   = "+" if total_return >= 0 else ""
+        daily_sign   = "+" if daily_pnl   >= 0 else ""
+
+        # Closed trades today
+        today        = datetime.now(timezone.utc).date()
+        all_trades   = self._trader.closed_trades
+        today_trades = [t for t in all_trades if t.exit_time.date() == today]
+        today_wins   = sum(1 for t in today_trades if t.pnl_usd > 0)
+        today_losses = len(today_trades) - today_wins
+
+        total_trades = len(all_trades)
+        total_wins   = sum(1 for t in all_trades if t.pnl_usd > 0)
+        win_rate     = total_wins / total_trades if total_trades > 0 else 0.0
+
+        dd_icon  = "🔴" if drawdown > 0.05 else ("🟡" if drawdown > 0.02 else "🟢")
+        pnl_icon = "📈" if daily_pnl >= 0 else "📉"
+        date_str = _esc(today.strftime("%d %b %Y"))
+
+        text = (
+            f"📊 *Daily Report* — {date_str}\n"
+            f"\n"
+            f"💰 Equity: `{equity:,.2f} USDT` \\(`{total_sign}{total_return:.2%}`\\)\n"
+            f"{pnl_icon} Daily PnL: `{daily_sign}{daily_pnl:.2f} USDT`\n"
+            f"{dd_icon} Drawdown: `{drawdown:.2%}`\n"
+            f"📂 Open positions: `{n_pos}`\n"
+            f"\n"
+            f"📅 Today: `{len(today_trades)} trades` "
+            f"\\(✅ `{today_wins}` \\| ❌ `{today_losses}`\\)\n"
+            f"🏆 All time: `{total_trades} trades` \\| Win rate: `{win_rate:.1%}`"
+        )
+        await self.send_message(text)
+
+    async def _daily_report_loop(self) -> None:
+        """Send daily report every day at 09:00 UTC."""
+        while True:
+            try:
+                now         = datetime.now(timezone.utc)
+                next_report = now.replace(hour=9, minute=0, second=0, microsecond=0)
+                if now >= next_report:
+                    next_report += timedelta(days=1)
+                wait_sec = (next_report - now).total_seconds()
+                logger.info(f"Next daily report in {wait_sec / 3600:.1f}h")
+                await asyncio.sleep(wait_sec)
+                await self.send_daily_report()
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                logger.warning(f"Daily report error: {exc}")
+                await asyncio.sleep(3600)   # retry in 1 h
+
+    async def _cmd_report(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not _authorized(update):
+            return
+        await self.send_daily_report()
 
     async def _cmd_stop(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not _authorized(update):
