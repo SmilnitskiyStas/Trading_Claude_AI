@@ -9,7 +9,11 @@ import pandas as pd
 
 from src.models.lgbm_model import CLASS_NAMES, LGBMTradingModel, MODELS_DIR
 from src.models.trainer import WalkForwardTrainer
+from src.utils.config import SYMBOLS as _ALL_SYMBOLS
 from src.utils.logger import logger
+
+# Must match the sym_map used during training in trainer.py
+_SYMBOL_ID_MAP: dict[str, int] = {s: i for i, s in enumerate(_ALL_SYMBOLS)}
 
 MIN_CONFIDENCE = 0.55   # ignore signals below this threshold
 
@@ -137,6 +141,9 @@ class SignalGenerator:
         if processed.empty:
             return {"symbol": symbol, "action": "hold", "signal": 0, "confidence": 0.0,
                     "error": "insufficient rows after processing"}
+
+        # Add symbol_id — must match feature used during training
+        processed["symbol_id"] = _SYMBOL_ID_MAP.get(symbol, 0)
 
         last_row = processed.iloc[[-1]]
         X, _, _ = self._trainer.prepare_features(last_row)
