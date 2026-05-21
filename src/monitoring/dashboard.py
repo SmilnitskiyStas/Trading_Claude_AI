@@ -977,7 +977,7 @@ async function pollRetrain() {
     const r = await fetch('/api/retrain/status');
     const d = await r.json();
     const logEl = document.getElementById('retrain-log');
-    logEl.textContent = (d.log || []).join('\n');
+    logEl.textContent = (d.log || []).join('\\n');
     logEl.scrollTop = logEl.scrollHeight;
     if (!d.running) {
       clearInterval(_retrainPoll); _retrainPoll = null;
