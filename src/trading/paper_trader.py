@@ -161,6 +161,9 @@ class PaperTrader:
         _prev_halted = False
         _agent_signals: dict[str, dict] = {}  # last agent override per symbol
 
+        # Background OHLCV refresh — keeps DB current without manual uploads
+        asyncio.create_task(self._refresh_ohlcv_loop(active, timeframe))
+
         while True:
             try:
                 # Check if Telegram sent /stop
@@ -395,6 +398,48 @@ class PaperTrader:
                 sizing.stop_loss_price,
                 sizing.take_profit_price,
             )
+
+    # ── Background OHLCV refresh ───────────────────────────────────────────
+
+    async def _refresh_ohlcv_loop(
+        self,
+        symbols: list[str],
+        timeframe: str,
+        interval_hours: int = 4,
+    ) -> None:
+        """
+        Downloads fresh OHLCV candles every N hours so the DB stays current.
+        Uses ACTIVE_EXCHANGES from config (set PRIMARY_EXCHANGE=kraken on VPS).
+        Runs as a background task — failures are logged but never crash the trader.
+        """
+        from src.data_pipeline.collector import OHLCVCollector
+        from src.exchanges.exchange_factory import ExchangeFactory
+        from src.utils.config import ACTIVE_EXCHANGES, EXCHANGE_CREDENTIALS
+
+        # First refresh after 5 min (let system fully start first)
+        await asyncio.sleep(300)
+
+        while True:
+            try:
+                ex_map = await ExchangeFactory.create_all(
+                    EXCHANGE_CREDENTIALS, ACTIVE_EXCHANGES
+                )
+                if ex_map:
+                    collector = OHLCVCollector()
+                    await collector.collect_all(ex_map, symbols, [timeframe])
+                    await ExchangeFactory.close_all(ex_map)
+                    logger.info(
+                        f"Background OHLCV refresh complete "
+                        f"({', '.join(ex_map.keys())}, {timeframe})"
+                    )
+                else:
+                    logger.warning("Background OHLCV refresh: no exchanges available")
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                logger.warning(f"Background OHLCV refresh failed: {exc}")
+
+            await asyncio.sleep(interval_hours * 3600)
 
     # ── Helpers ────────────────────────────────────────────────────────────
 
