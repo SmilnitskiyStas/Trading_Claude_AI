@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
+import hmac
 import json
 import secrets
 import sys
@@ -23,12 +25,35 @@ from src.utils.config import (
 )
 from src.utils.logger import logger
 
-# ── Basic-auth middleware ──────────────────────────────────────────────────
+# ── Auth helpers ───────────────────────────────────────────────────────────
+# Strategy:
+#   1. Browser loads "/" with HTTP Basic Auth → dialog appears once
+#   2. On success, a session cookie is set
+#   3. All JS fetch() calls are authenticated via that cookie (no more dialogs)
+
+_COOKIE_NAME = "_td_sess"
+
+
+def _session_token() -> str:
+    """Derive a fixed session token from the configured password (HMAC-SHA256)."""
+    if not DASHBOARD_PASSWORD:
+        return ""
+    return hmac.new(
+        DASHBOARD_PASSWORD.encode(), b"td_session_v1", hashlib.sha256
+    ).hexdigest()
+
 
 def _check_auth(request: Request) -> bool:
-    """Returns True if request passes HTTP Basic Auth (or auth is not configured)."""
+    """Return True when auth is disabled OR request carries valid cookie/Basic-Auth."""
     if not DASHBOARD_USER or not DASHBOARD_PASSWORD:
-        return True                               # auth not configured → allow all
+        return True                              # auth not configured → open access
+
+    # ① Cookie (set after first successful Basic-Auth login — used by all JS calls)
+    cookie = request.cookies.get(_COOKIE_NAME, "")
+    if cookie and secrets.compare_digest(cookie, _session_token()):
+        return True
+
+    # ② HTTP Basic Auth (initial browser login)
     auth = request.headers.get("Authorization", "")
     if not auth.startswith("Basic "):
         return False
@@ -43,11 +68,12 @@ def _check_auth(request: Request) -> bool:
     )
 
 
-_AUTH_REQUIRED = Response(
-    status_code=401,
-    content="Unauthorized",
-    headers={"WWW-Authenticate": 'Basic realm="Trading Dashboard"'},
-)
+def _auth_required_response() -> Response:
+    return Response(
+        status_code=401,
+        content="Unauthorized — enter your dashboard credentials",
+        headers={"WWW-Authenticate": 'Basic realm="Trading Dashboard"'},
+    )
 
 # ── Retrain state ──────────────────────────────────────────────────────────
 
@@ -97,8 +123,17 @@ def create_app(
     @app.get("/", response_class=HTMLResponse)
     async def index(request: Request) -> Response:
         if not _check_auth(request):
-            return _AUTH_REQUIRED
-        return HTMLResponse(_HTML)
+            return _auth_required_response()
+        # Serve page and set session cookie so JS API calls need no re-auth
+        resp = HTMLResponse(_HTML)
+        if DASHBOARD_USER and DASHBOARD_PASSWORD:
+            resp.set_cookie(
+                _COOKIE_NAME, _session_token(),
+                max_age=86400 * 7,   # 7 days
+                httponly=True,
+                samesite="strict",
+            )
+        return resp
 
     @app.get("/health")
     async def health() -> dict:
@@ -107,7 +142,7 @@ def create_app(
     @app.get("/api/status")
     async def api_status(request: Request) -> Response:
         if not _check_auth(request):
-            return _AUTH_REQUIRED
+            return _auth_required_response()
         return JSONResponse(_build_status(trader, agent))
 
     @app.get("/api/trades")
@@ -273,7 +308,7 @@ def create_app(
     @app.post("/api/agent/enable")
     async def api_agent_enable(request: Request) -> Response:
         if not _check_auth(request):
-            return _AUTH_REQUIRED
+            return _auth_required_response()
         if agent is None:
             return JSONResponse({"ok": False, "error": "Agent not initialized (check ANTHROPIC_API_KEY in .env)"})
         agent.enabled = True
@@ -283,7 +318,7 @@ def create_app(
     @app.post("/api/agent/disable")
     async def api_agent_disable(request: Request) -> Response:
         if not _check_auth(request):
-            return _AUTH_REQUIRED
+            return _auth_required_response()
         if agent is None:
             return JSONResponse({"ok": False, "error": "Agent not available"})
         agent.enabled = False
@@ -295,7 +330,7 @@ def create_app(
     @app.get("/api/retrain/status")
     async def api_retrain_status(request: Request) -> Response:
         if not _check_auth(request):
-            return _AUTH_REQUIRED
+            return _auth_required_response()
         return JSONResponse({
             "running": _retrain_running,
             "log":     _retrain_log[-30:],
@@ -304,7 +339,7 @@ def create_app(
     @app.post("/api/retrain")
     async def api_retrain(request: Request) -> Response:
         if not _check_auth(request):
-            return _AUTH_REQUIRED
+            return _auth_required_response()
         global _retrain_running
         if _retrain_running:
             return JSONResponse({"ok": False, "error": "Retrain already in progress"})
