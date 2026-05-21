@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import base64
 import hashlib
 import hmac
 import json
@@ -15,7 +14,7 @@ import time
 
 import pandas as pd
 from fastapi import FastAPI, File, Request, Response, UploadFile, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from sqlalchemy import text
 import uvicorn
 
@@ -26,16 +25,14 @@ from src.utils.config import (
 from src.utils.logger import logger
 
 # ── Auth helpers ───────────────────────────────────────────────────────────
-# Strategy:
-#   1. Browser loads "/" with HTTP Basic Auth → dialog appears once
-#   2. On success, a session cookie is set
-#   3. All JS fetch() calls are authenticated via that cookie (no more dialogs)
+# Uses a custom HTML login form + session cookie.
+# No browser dialog — user logs in via a styled form page.
 
 _COOKIE_NAME = "_td_sess"
 
 
 def _session_token() -> str:
-    """Derive a fixed session token from the configured password (HMAC-SHA256)."""
+    """Derive a stable session token from the password (HMAC-SHA256)."""
     if not DASHBOARD_PASSWORD:
         return ""
     return hmac.new(
@@ -43,37 +40,57 @@ def _session_token() -> str:
     ).hexdigest()
 
 
-def _check_auth(request: Request) -> bool:
-    """Return True when auth is disabled OR request carries valid cookie/Basic-Auth."""
+def _is_authenticated(request: Request) -> bool:
+    """Return True when auth is disabled OR the session cookie is valid."""
     if not DASHBOARD_USER or not DASHBOARD_PASSWORD:
-        return True                              # auth not configured → open access
-
-    # ① Cookie (set after first successful Basic-Auth login — used by all JS calls)
+        return True                              # auth not configured → open
     cookie = request.cookies.get(_COOKIE_NAME, "")
-    if cookie and secrets.compare_digest(cookie, _session_token()):
-        return True
-
-    # ② HTTP Basic Auth (initial browser login)
-    auth = request.headers.get("Authorization", "")
-    if not auth.startswith("Basic "):
-        return False
-    try:
-        decoded = base64.b64decode(auth[6:]).decode()
-        user, _, password = decoded.partition(":")
-    except Exception:
-        return False
-    return (
-        secrets.compare_digest(user.encode(),     DASHBOARD_USER.encode()) and
-        secrets.compare_digest(password.encode(), DASHBOARD_PASSWORD.encode())
-    )
+    return bool(cookie and secrets.compare_digest(cookie, _session_token()))
 
 
-def _auth_required_response() -> Response:
-    return Response(
-        status_code=401,
-        content="Unauthorized — enter your dashboard credentials",
-        headers={"WWW-Authenticate": 'Basic realm="Trading Dashboard"'},
-    )
+_LOGIN_PAGE = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Trading Dashboard — Login</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: #0d1117; color: #c9d1d9;
+         font-family: 'Segoe UI', monospace;
+         display: flex; align-items: center; justify-content: center;
+         min-height: 100vh; }
+  .box { background: #161b22; border: 1px solid #30363d; border-radius: 10px;
+         padding: 36px 40px; width: 340px; }
+  h2  { font-size: 1.1rem; margin-bottom: 28px; }
+  label { display: block; font-size: .75rem; color: #8b949e; margin-bottom: 4px; }
+  input { width: 100%; padding: 9px 11px; margin-bottom: 18px;
+          background: #0d1117; border: 1px solid #30363d; border-radius: 6px;
+          color: #c9d1d9; font-size: .9rem; outline: none; }
+  input:focus { border-color: #1f6feb; }
+  button { width: 100%; padding: 10px; background: #1f6feb; border: none;
+           border-radius: 6px; color: #fff; font-size: .9rem;
+           font-weight: 600; cursor: pointer; }
+  button:hover { background: #388bfd; }
+  .err { color: #f85149; font-size: .8rem; margin-bottom: 14px;
+         padding: 8px 12px; background: rgba(248,81,73,.1);
+         border: 1px solid rgba(248,81,73,.3); border-radius: 6px; }
+</style>
+</head>
+<body>
+<div class="box">
+  <h2>&#x1F4C8; Trading Dashboard</h2>
+  {error}
+  <form method="POST" action="/login">
+    <label>Username</label>
+    <input type="text" name="username" autofocus autocomplete="username">
+    <label>Password</label>
+    <input type="password" name="password" autocomplete="current-password">
+    <button type="submit">Sign In</button>
+  </form>
+</div>
+</body>
+</html>"""
 
 # ── Retrain state ──────────────────────────────────────────────────────────
 
@@ -122,17 +139,42 @@ def create_app(
 
     @app.get("/", response_class=HTMLResponse)
     async def index(request: Request) -> Response:
-        if not _check_auth(request):
-            return _auth_required_response()
-        # Serve page and set session cookie so JS API calls need no re-auth
-        resp = HTMLResponse(_HTML)
-        if DASHBOARD_USER and DASHBOARD_PASSWORD:
+        if not _is_authenticated(request):
+            return RedirectResponse("/login", status_code=302)
+        return HTMLResponse(_HTML)
+
+    # ── Login form ─────────────────────────────────────────────────────────
+
+    @app.get("/login", response_class=HTMLResponse)
+    async def login_page(request: Request) -> Response:
+        if _is_authenticated(request):
+            return RedirectResponse("/", status_code=302)
+        return HTMLResponse(_LOGIN_PAGE.format(error=""))
+
+    @app.post("/login")
+    async def login_submit(request: Request) -> Response:
+        form    = await request.form()
+        user    = str(form.get("username", ""))
+        pwd     = str(form.get("password", ""))
+        if (DASHBOARD_USER and DASHBOARD_PASSWORD and
+                secrets.compare_digest(user, DASHBOARD_USER) and
+                secrets.compare_digest(pwd,  DASHBOARD_PASSWORD)):
+            resp = RedirectResponse("/", status_code=302)
             resp.set_cookie(
                 _COOKIE_NAME, _session_token(),
-                max_age=86400 * 7,   # 7 days
+                max_age=86400 * 7,   # 7-day session
                 httponly=True,
-                samesite="strict",
+                samesite="lax",      # lax works through nginx proxies
             )
+            return resp
+        # Wrong credentials — show form with error
+        err = '<div class="err">&#x274C; Invalid username or password</div>'
+        return HTMLResponse(_LOGIN_PAGE.format(error=err), status_code=401)
+
+    @app.get("/logout")
+    async def logout() -> Response:
+        resp = RedirectResponse("/login", status_code=302)
+        resp.delete_cookie(_COOKIE_NAME)
         return resp
 
     @app.get("/health")
@@ -141,8 +183,8 @@ def create_app(
 
     @app.get("/api/status")
     async def api_status(request: Request) -> Response:
-        if not _check_auth(request):
-            return _auth_required_response()
+        if not _is_authenticated(request):
+            return JSONResponse({"error": "Unauthorized"}, status_code=401)
         return JSONResponse(_build_status(trader, agent))
 
     @app.get("/api/trades")
@@ -307,8 +349,8 @@ def create_app(
 
     @app.post("/api/agent/enable")
     async def api_agent_enable(request: Request) -> Response:
-        if not _check_auth(request):
-            return _auth_required_response()
+        if not _is_authenticated(request):
+            return JSONResponse({"error": "Unauthorized"}, status_code=401)
         if agent is None:
             return JSONResponse({"ok": False, "error": "Agent not initialized (check ANTHROPIC_API_KEY in .env)"})
         agent.enabled = True
@@ -317,8 +359,8 @@ def create_app(
 
     @app.post("/api/agent/disable")
     async def api_agent_disable(request: Request) -> Response:
-        if not _check_auth(request):
-            return _auth_required_response()
+        if not _is_authenticated(request):
+            return JSONResponse({"error": "Unauthorized"}, status_code=401)
         if agent is None:
             return JSONResponse({"ok": False, "error": "Agent not available"})
         agent.enabled = False
@@ -329,8 +371,8 @@ def create_app(
 
     @app.get("/api/retrain/status")
     async def api_retrain_status(request: Request) -> Response:
-        if not _check_auth(request):
-            return _auth_required_response()
+        if not _is_authenticated(request):
+            return JSONResponse({"error": "Unauthorized"}, status_code=401)
         return JSONResponse({
             "running": _retrain_running,
             "log":     _retrain_log[-30:],
@@ -338,8 +380,8 @@ def create_app(
 
     @app.post("/api/retrain")
     async def api_retrain(request: Request) -> Response:
-        if not _check_auth(request):
-            return _auth_required_response()
+        if not _is_authenticated(request):
+            return JSONResponse({"error": "Unauthorized"}, status_code=401)
         global _retrain_running
         if _retrain_running:
             return JSONResponse({"ok": False, "error": "Retrain already in progress"})
