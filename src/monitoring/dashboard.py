@@ -5,8 +5,13 @@ import json
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse
+import io
+import time
+
+import pandas as pd
+from fastapi import FastAPI, File, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse, JSONResponse
+from sqlalchemy import text
 import uvicorn
 
 from src.utils.config import ANTHROPIC_API_KEY, DASHBOARD_HOST, DASHBOARD_PORT
@@ -89,6 +94,73 @@ def create_app(
         if trader is None:
             return {"curve": []}
         return {"curve": trader.equity_curve[-200:]}
+
+    # ── OHLCV upload ──────────────────────────────────────────────────────
+
+    @app.post("/api/upload/ohlcv")
+    async def upload_ohlcv(file: UploadFile = File(...)) -> JSONResponse:
+        """Accept CSV file and bulk-insert into ohlcv_data table."""
+        from src.utils.database import AsyncSessionFactory
+        t0 = time.time()
+        try:
+            content = await file.read()
+            df = pd.read_csv(io.BytesIO(content))
+
+            required = {"exchange", "symbol", "timeframe", "timestamp"}
+            missing = required - set(df.columns)
+            if missing:
+                return JSONResponse(status_code=400,
+                                    content={"error": f"Missing columns: {missing}"})
+
+            if "id" in df.columns:
+                df = df.drop(columns=["id"])
+            df = df.where(pd.notnull(df), None)
+
+            records = df.to_dict("records")
+            insert_sql = text("""
+                INSERT INTO ohlcv_data
+                    (exchange, symbol, timeframe, timestamp,
+                     open, high, low, close, volume)
+                VALUES
+                    (:exchange, :symbol, :timeframe, :timestamp,
+                     :open, :high, :low, :close, :volume)
+                ON CONFLICT (exchange, symbol, timeframe, timestamp) DO NOTHING
+            """)
+
+            async with AsyncSessionFactory() as session:
+                await session.execute(text("TRUNCATE ohlcv_data"))
+                chunk = 5000
+                for i in range(0, len(records), chunk):
+                    await session.execute(insert_sql, records[i : i + chunk])
+                await session.commit()
+
+            duration = round(time.time() - t0, 1)
+            logger.info(f"OHLCV upload: {len(df)} rows in {duration}s ({file.filename})")
+            return JSONResponse(content={
+                "status": "ok", "rows": len(df), "duration_sec": duration
+            })
+        except Exception as exc:
+            logger.error(f"OHLCV upload failed: {exc}")
+            return JSONResponse(status_code=500, content={"error": str(exc)})
+
+    @app.get("/api/db/stats")
+    async def api_db_stats() -> dict:
+        """Return row counts per exchange/symbol/timeframe."""
+        from src.utils.database import AsyncSessionFactory
+        try:
+            async with AsyncSessionFactory() as session:
+                result = await session.execute(text("""
+                    SELECT exchange, symbol, timeframe, COUNT(*) AS cnt
+                    FROM ohlcv_data
+                    GROUP BY 1, 2, 3
+                    ORDER BY 1, 2, 3
+                """))
+                rows = [{"exchange": r[0], "symbol": r[1],
+                         "timeframe": r[2], "count": int(r[3])}
+                        for r in result.fetchall()]
+            return {"rows": rows, "total": sum(r["count"] for r in rows)}
+        except Exception as exc:
+            return {"rows": [], "total": 0, "error": str(exc)}
 
     # ── AI Agent toggle ────────────────────────────────────────────────────
 
@@ -277,6 +349,31 @@ _HTML = """<!DOCTYPE html>
   input:disabled + .slider { opacity: .4; cursor: not-allowed; }
   .toggle-status { font-size: .78rem; font-weight: 600; min-width: 60px; }
 
+  /* ── Upload panel ────────────────────────────────────────── */
+  .upload-panel {
+    background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 18px 20px;
+  }
+  .upload-desc { font-size: .78rem; color: #8b949e; margin: 6px 0 14px; line-height: 1.5; }
+  .upload-steps { background: #0d1117; border: 1px solid #21262d; border-radius: 6px;
+                  padding: 12px 14px; margin-bottom: 14px; }
+  .upload-steps .step-title { font-size: .72rem; color: #8b949e; margin-bottom: 6px; }
+  .upload-steps code { font-size: .73rem; color: #79c0ff; white-space: pre; display: block;
+                       line-height: 1.6; }
+  .drop-zone {
+    border: 2px dashed #30363d; border-radius: 8px; padding: 28px;
+    text-align: center; cursor: pointer; transition: .2s;
+    font-size: .85rem; color: #8b949e;
+  }
+  .drop-zone:hover, .drop-zone.over { border-color: #1f6feb; color: #79c0ff; background: #0d1117; }
+  .progress-wrap { background: #21262d; border-radius: 4px; height: 6px; margin-top: 10px; overflow: hidden; }
+  .progress-bar  { height: 100%; background: #1f6feb; width: 0%; transition: width .3s; }
+  .stats-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+                gap: 6px; margin-top: 12px; }
+  .stats-item { background: #0d1117; border: 1px solid #21262d; border-radius: 6px;
+                padding: 8px 12px; font-size: .75rem; }
+  .stats-item .si-sym  { font-weight: 600; color: #c9d1d9; }
+  .stats-item .si-info { color: #8b949e; margin-top: 2px; }
+
   /* ── Tables ───────────────────────────────────────────────── */
   table { width: 100%; border-collapse: collapse; font-size: .83rem; }
   th { text-align: left; padding: 8px 12px; background: #161b22;
@@ -325,6 +422,33 @@ _HTML = """<!DOCTYPE html>
       </label>
       <span class="toggle-status gray" id="agent-status-text">—</span>
     </div>
+  </div>
+
+  <!-- OHLCV Data Upload -->
+  <div class="upload-panel">
+    <div class="section-title">&#x1F4C2; OHLCV Data Upload</div>
+    <div class="upload-desc">
+      Upload a CSV file exported from your local PostgreSQL to import OHLCV data into the server database.
+      Existing data will be replaced.
+    </div>
+    <div class="upload-steps">
+      <div class="step-title">Local export commands (Windows cmd.exe):</div>
+      <code>docker compose exec postgres psql -U trader trading -c "\\COPY ohlcv_data TO '/tmp/ohlcv.csv' WITH (FORMAT csv, HEADER true)"
+docker cp trading_postgres:/tmp/ohlcv.csv ohlcv.csv</code>
+    </div>
+    <div class="drop-zone" id="drop-zone" onclick="document.getElementById('file-input').click()"
+         ondragover="event.preventDefault();this.classList.add('over')"
+         ondragleave="this.classList.remove('over')"
+         ondrop="this.classList.remove('over');handleFile(event.dataTransfer.files[0]);event.preventDefault()">
+      <span id="drop-text">&#x1F5C2; Click or drag CSV file here</span>
+    </div>
+    <input type="file" id="file-input" accept=".csv" style="display:none"
+           onchange="handleFile(this.files[0])">
+    <div class="progress-wrap" id="progress-wrap" style="display:none">
+      <div class="progress-bar" id="progress-bar"></div>
+    </div>
+    <div id="upload-status" style="font-size:.8rem;margin-top:8px;min-height:20px"></div>
+    <div id="db-stats-wrap"></div>
   </div>
 
   <!-- Open positions -->
@@ -451,6 +575,83 @@ async function toggleAgent(enable) {
   }
 }
 
+// ── OHLCV Upload ───────────────────────────────────────────────────────────
+function handleFile(file) {
+  if (!file) return;
+  if (!file.name.endsWith('.csv')) {
+    setUploadStatus('&#x274C; Only .csv files are supported', 'red'); return;
+  }
+  document.getElementById('drop-text').textContent = '&#x23F3; Uploading: ' + file.name;
+  const prog = document.getElementById('progress-wrap');
+  const bar  = document.getElementById('progress-bar');
+  prog.style.display = 'block';
+  bar.style.width = '0%';
+
+  const form = new FormData();
+  form.append('file', file);
+  const xhr = new XMLHttpRequest();
+
+  xhr.upload.onprogress = e => {
+    if (e.lengthComputable) bar.style.width = Math.round(e.loaded / e.total * 80) + '%';
+  };
+  xhr.onload = () => {
+    bar.style.width = '100%';
+    try {
+      const d = JSON.parse(xhr.responseText);
+      if (d.error) {
+        setUploadStatus('&#x274C; Error: ' + d.error, 'red');
+      } else {
+        setUploadStatus(
+          `&#x2705; Imported <b>${d.rows.toLocaleString()}</b> rows in ${d.duration_sec}s`,
+          'green'
+        );
+        loadDbStats();
+      }
+    } catch(e) { setUploadStatus('&#x274C; Server error', 'red'); }
+    document.getElementById('drop-text').textContent = '&#x1F5C2; Click or drag CSV file here';
+    document.getElementById('file-input').value = '';
+  };
+  xhr.onerror = () => {
+    setUploadStatus('&#x274C; Upload failed', 'red');
+    document.getElementById('drop-text').textContent = '&#x1F5C2; Click or drag CSV file here';
+  };
+  xhr.open('POST', '/api/upload/ohlcv');
+  xhr.send(form);
+  setUploadStatus('&#x23F3; Uploading ' + (file.size / 1024 / 1024).toFixed(1) + ' MB...', 'yellow');
+}
+
+function setUploadStatus(msg, color) {
+  const el = document.getElementById('upload-status');
+  el.innerHTML = msg;
+  el.style.color = color === 'green' ? '#3fb950' : color === 'red' ? '#f85149' : '#d29922';
+}
+
+async function loadDbStats() {
+  try {
+    const r = await fetch('/api/db/stats');
+    const d = await r.json();
+    const wrap = document.getElementById('db-stats-wrap');
+    if (!d.total) { wrap.innerHTML = ''; return; }
+    const bySymbol = {};
+    d.rows.forEach(row => {
+      if (!bySymbol[row.symbol]) bySymbol[row.symbol] = [];
+      bySymbol[row.symbol].push(row);
+    });
+    const items = Object.entries(bySymbol).map(([sym, rows]) => {
+      const info = rows.map(r => `${r.timeframe}: ${r.count.toLocaleString()}`).join(' · ');
+      return `<div class="stats-item">
+        <div class="si-sym">${sym}</div>
+        <div class="si-info">${info}</div>
+      </div>`;
+    }).join('');
+    wrap.innerHTML = `
+      <div style="font-size:.75rem;color:#8b949e;margin:12px 0 6px">
+        Database: <b style="color:#c9d1d9">${d.total.toLocaleString()}</b> candles total
+      </div>
+      <div class="stats-grid">${items}</div>`;
+  } catch(e) {}
+}
+
 // ── Recent trades ──────────────────────────────────────────────────────────
 async function loadTrades() {
   try {
@@ -492,6 +693,7 @@ function connect() {
 // ── Init ───────────────────────────────────────────────────────────────────
 fetch('/api/status').then(r => r.json()).then(applyStatus).catch(console.error);
 loadTrades();
+loadDbStats();
 setInterval(loadTrades, 15000);
 connect();
 </script>
