@@ -80,7 +80,7 @@ _LOGIN_PAGE = """<!DOCTYPE html>
 <body>
 <div class="box">
   <h2>&#x1F4C8; Trading Dashboard</h2>
-  {error}
+  <!--ERROR-->
   <form method="POST" action="/login">
     <label>Username</label>
     <input type="text" name="username" autofocus autocomplete="username">
@@ -149,7 +149,7 @@ def create_app(
     async def login_page(request: Request) -> Response:
         if _is_authenticated(request):
             return RedirectResponse("/", status_code=302)
-        return HTMLResponse(_LOGIN_PAGE.format(error=""))
+        return HTMLResponse(_LOGIN_PAGE.replace("<!--ERROR-->", ""))
 
     @app.post("/login")
     async def login_submit(request: Request) -> Response:
@@ -167,9 +167,9 @@ def create_app(
                 samesite="lax",      # lax works through nginx proxies
             )
             return resp
-        # Wrong credentials — show form with error
+        # Wrong credentials — show form with error message
         err = '<div class="err">&#x274C; Invalid username or password</div>'
-        return HTMLResponse(_LOGIN_PAGE.format(error=err), status_code=401)
+        return HTMLResponse(_LOGIN_PAGE.replace("<!--ERROR-->", err), status_code=401)
 
     @app.get("/logout")
     async def logout() -> Response:
