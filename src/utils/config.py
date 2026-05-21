@@ -103,6 +103,9 @@ TELEGRAM_CHAT_ID: str = _get("TELEGRAM_CHAT_ID", "")
 
 DASHBOARD_HOST: str = _get("DASHBOARD_HOST", "0.0.0.0")
 DASHBOARD_PORT: int = int(_get("DASHBOARD_PORT", "8080"))
+# HTTP Basic Auth — leave empty to disable (not recommended for production)
+DASHBOARD_USER:     str = _get("DASHBOARD_USER", "")
+DASHBOARD_PASSWORD: str = _get("DASHBOARD_PASSWORD", "")
 
 # ── Logging ────────────────────────────────────────────────────────────────
 

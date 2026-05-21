@@ -83,15 +83,17 @@ class TradingAgent:
                 logger.debug("Agent: returning cached analysis")
                 return cached
 
-        # Fetch fresh news + sentiment
+        # Fetch fresh news + sentiment + Fear & Greed
         news_items = await self._fetcher.fetch_all(active_symbols)
         sentiment_results = self._analyzer.analyze(news_items)
         sentiment_by_symbol = self._analyzer.aggregate_by_symbol(sentiment_results)
+        fear_greed = await self._fetch_fear_greed()
 
         # Build prompt payload
         portfolio = self._portfolio_summary()
         user_content = self._build_user_message(
-            active_symbols, ml_signals, sentiment_by_symbol, portfolio, news_items[:10]
+            active_symbols, ml_signals, sentiment_by_symbol, portfolio,
+            news_items[:10], fear_greed,
         )
 
         logger.info(f"Agent: calling {self._provider} ...")
@@ -159,6 +161,28 @@ class TradingAgent:
             "halted":         s["halted"],
         }
 
+    async def _fetch_fear_greed(self) -> dict:
+        """
+        Fetch Crypto Fear & Greed Index from alternative.me (free, no API key).
+        Returns {"value": 0-100, "label": "Extreme Fear|Fear|Neutral|Greed|Extreme Greed"}.
+        Falls back to neutral on any error.
+        """
+        import asyncio
+        import urllib.request
+        try:
+            loop = asyncio.get_event_loop()
+            def _get() -> dict:
+                with urllib.request.urlopen(
+                    "https://api.alternative.me/fng/?limit=1", timeout=5
+                ) as resp:
+                    return json.loads(resp.read())
+            data = await loop.run_in_executor(None, _get)
+            entry = data["data"][0]
+            return {"value": int(entry["value"]), "label": entry["value_classification"]}
+        except Exception as exc:
+            logger.debug(f"Fear & Greed fetch failed (using neutral): {exc}")
+            return {"value": 50, "label": "Neutral"}
+
     def _build_user_message(
         self,
         symbols: list[str],
@@ -166,10 +190,21 @@ class TradingAgent:
         sentiment: dict[str, float],
         portfolio: dict,
         news_items: list,
+        fear_greed: dict | None = None,
     ) -> str:
+        fg = fear_greed or {"value": 50, "label": "Neutral"}
+        fg_emoji = (
+            "😱" if fg["value"] < 25 else
+            "😨" if fg["value"] < 45 else
+            "😐" if fg["value"] < 55 else
+            "😊" if fg["value"] < 75 else "🤑"
+        )
         lines = [
             "=== PORTFOLIO STATUS ===",
             json.dumps(portfolio, indent=2),
+            "",
+            f"=== MARKET SENTIMENT ===",
+            f"Fear & Greed Index: {fg['value']}/100 — {fg['label']} {fg_emoji}",
             "",
             "=== ML SIGNALS ===",
         ]

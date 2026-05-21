@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
+import secrets
+import sys
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
@@ -9,13 +12,47 @@ import io
 import time
 
 import pandas as pd
-from fastapi import FastAPI, File, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, File, Request, Response, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse
 from sqlalchemy import text
 import uvicorn
 
-from src.utils.config import ANTHROPIC_API_KEY, DASHBOARD_HOST, DASHBOARD_PORT
+from src.utils.config import (
+    ANTHROPIC_API_KEY, DASHBOARD_HOST, DASHBOARD_PORT,
+    DASHBOARD_USER, DASHBOARD_PASSWORD,
+)
 from src.utils.logger import logger
+
+# ── Basic-auth middleware ──────────────────────────────────────────────────
+
+def _check_auth(request: Request) -> bool:
+    """Returns True if request passes HTTP Basic Auth (or auth is not configured)."""
+    if not DASHBOARD_USER or not DASHBOARD_PASSWORD:
+        return True                               # auth not configured → allow all
+    auth = request.headers.get("Authorization", "")
+    if not auth.startswith("Basic "):
+        return False
+    try:
+        decoded = base64.b64decode(auth[6:]).decode()
+        user, _, password = decoded.partition(":")
+    except Exception:
+        return False
+    return (
+        secrets.compare_digest(user.encode(),     DASHBOARD_USER.encode()) and
+        secrets.compare_digest(password.encode(), DASHBOARD_PASSWORD.encode())
+    )
+
+
+_AUTH_REQUIRED = Response(
+    status_code=401,
+    content="Unauthorized",
+    headers={"WWW-Authenticate": 'Basic realm="Trading Dashboard"'},
+)
+
+# ── Retrain state ──────────────────────────────────────────────────────────
+
+_retrain_running: bool = False
+_retrain_log:     list[str] = []
 
 if TYPE_CHECKING:
     from src.trading.paper_trader import PaperTrader
@@ -58,7 +95,9 @@ def create_app(
     # ── REST endpoints ─────────────────────────────────────────────────────
 
     @app.get("/", response_class=HTMLResponse)
-    async def index() -> HTMLResponse:
+    async def index(request: Request) -> Response:
+        if not _check_auth(request):
+            return _AUTH_REQUIRED
         return HTMLResponse(_HTML)
 
     @app.get("/health")
@@ -66,8 +105,10 @@ def create_app(
         return {"status": "ok"}
 
     @app.get("/api/status")
-    async def api_status() -> dict:
-        return _build_status(trader, agent)
+    async def api_status(request: Request) -> Response:
+        if not _check_auth(request):
+            return _AUTH_REQUIRED
+        return JSONResponse(_build_status(trader, agent))
 
     @app.get("/api/trades")
     async def api_trades() -> dict:
@@ -230,20 +271,45 @@ def create_app(
         }
 
     @app.post("/api/agent/enable")
-    async def api_agent_enable() -> dict:
+    async def api_agent_enable(request: Request) -> Response:
+        if not _check_auth(request):
+            return _AUTH_REQUIRED
         if agent is None:
-            return {"ok": False, "error": "Agent not initialized (check ANTHROPIC_API_KEY in .env)"}
+            return JSONResponse({"ok": False, "error": "Agent not initialized (check ANTHROPIC_API_KEY in .env)"})
         agent.enabled = True
         logger.info("AI agent ENABLED via dashboard")
-        return {"ok": True, "enabled": True}
+        return JSONResponse({"ok": True, "enabled": True})
 
     @app.post("/api/agent/disable")
-    async def api_agent_disable() -> dict:
+    async def api_agent_disable(request: Request) -> Response:
+        if not _check_auth(request):
+            return _AUTH_REQUIRED
         if agent is None:
-            return {"ok": False, "error": "Agent not available"}
+            return JSONResponse({"ok": False, "error": "Agent not available"})
         agent.enabled = False
         logger.info("AI agent DISABLED via dashboard")
-        return {"ok": True, "enabled": False}
+        return JSONResponse({"ok": True, "enabled": False})
+
+    # ── Model retrain ──────────────────────────────────────────────────────
+
+    @app.get("/api/retrain/status")
+    async def api_retrain_status(request: Request) -> Response:
+        if not _check_auth(request):
+            return _AUTH_REQUIRED
+        return JSONResponse({
+            "running": _retrain_running,
+            "log":     _retrain_log[-30:],
+        })
+
+    @app.post("/api/retrain")
+    async def api_retrain(request: Request) -> Response:
+        if not _check_auth(request):
+            return _AUTH_REQUIRED
+        global _retrain_running
+        if _retrain_running:
+            return JSONResponse({"ok": False, "error": "Retrain already in progress"})
+        asyncio.create_task(_run_retrain())
+        return JSONResponse({"ok": True, "message": "Retrain started in background"})
 
     # ── WebSocket ──────────────────────────────────────────────────────────
 
@@ -323,6 +389,34 @@ def _build_status(
         "agent_available": agent is not None,
         "agent_enabled":   agent.enabled if agent else False,
     }
+
+
+async def _run_retrain() -> None:
+    """Run ML retraining in a subprocess so the trader keeps running."""
+    global _retrain_running, _retrain_log
+    _retrain_running = True
+    _retrain_log = ["[retrain] Starting walk-forward training..."]
+    logger.info("Model retrain started via dashboard")
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable, "main.py", "--mode", "train",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        assert proc.stdout is not None
+        async for raw in proc.stdout:
+            line = raw.decode(errors="replace").rstrip()
+            _retrain_log.append(line)
+            if len(_retrain_log) > 200:          # keep last 200 lines
+                _retrain_log = _retrain_log[-200:]
+        await proc.wait()
+        _retrain_log.append(f"[retrain] Done — exit code {proc.returncode}")
+        logger.info(f"Model retrain finished (exit {proc.returncode})")
+    except Exception as exc:
+        _retrain_log.append(f"[retrain] ERROR: {exc}")
+        logger.error(f"Model retrain error: {exc}")
+    finally:
+        _retrain_running = False
 
 
 async def run_dashboard(
@@ -518,6 +612,28 @@ docker cp trading_postgres:/tmp/ohlcv.csv ohlcv.csv</code>
     </div>
     <div id="upload-status" style="font-size:.8rem;margin-top:8px;min-height:20px"></div>
     <div id="db-stats-wrap"></div>
+  </div>
+
+  <!-- Model Retrain -->
+  <div class="upload-panel">
+    <div class="section-title">&#x1F9E0; ML Model Retrain</div>
+    <div class="upload-desc">
+      Retrain the LightGBM model on all data currently in the database.
+      Runs in background — trading continues uninterrupted. Takes 5-15 minutes.
+    </div>
+    <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+      <button id="retrain-btn" onclick="startRetrain()"
+        style="padding:8px 18px;background:#1f6feb;color:#fff;border:none;border-radius:6px;
+               cursor:pointer;font-size:.83rem;font-weight:600">
+        &#x25B6; Start Retrain
+      </button>
+      <span id="retrain-status" style="font-size:.8rem;color:#8b949e"></span>
+    </div>
+    <div id="retrain-log"
+         style="display:none;margin-top:12px;background:#0d1117;border:1px solid #21262d;
+                border-radius:6px;padding:10px 12px;font-size:.72rem;font-family:monospace;
+                color:#8b949e;max-height:160px;overflow-y:auto;white-space:pre-wrap">
+    </div>
   </div>
 
   <!-- Equity Curve Chart -->
@@ -759,6 +875,41 @@ async function loadDbStats() {
         Database: <b style="color:#c9d1d9">${d.total.toLocaleString()}</b> candles total
       </div>
       <div class="stats-grid">${items}</div>`;
+  } catch(e) {}
+}
+
+// ── Model retrain ─────────────────────────────────────────────────────────
+let _retrainPoll = null;
+
+async function startRetrain() {
+  try {
+    const r = await fetch('/api/retrain', { method: 'POST' });
+    const d = await r.json();
+    if (!d.ok) { alert('Retrain error: ' + (d.error || 'unknown')); return; }
+    document.getElementById('retrain-btn').disabled = true;
+    document.getElementById('retrain-log').style.display = 'block';
+    document.getElementById('retrain-status').textContent = '⏳ Running...';
+    document.getElementById('retrain-status').style.color = '#d29922';
+    if (_retrainPoll) clearInterval(_retrainPoll);
+    _retrainPoll = setInterval(pollRetrain, 3000);
+  } catch(e) { alert('Request failed: ' + e); }
+}
+
+async function pollRetrain() {
+  try {
+    const r = await fetch('/api/retrain/status');
+    const d = await r.json();
+    const logEl = document.getElementById('retrain-log');
+    logEl.textContent = (d.log || []).join('\n');
+    logEl.scrollTop = logEl.scrollHeight;
+    if (!d.running) {
+      clearInterval(_retrainPoll); _retrainPoll = null;
+      document.getElementById('retrain-btn').disabled = false;
+      const done = (d.log || []).slice(-1)[0] || '';
+      const ok = done.includes('exit code 0');
+      document.getElementById('retrain-status').textContent = ok ? '✅ Done!' : '⚠ Finished (check log)';
+      document.getElementById('retrain-status').style.color  = ok ? '#3fb950' : '#d29922';
+    }
   } catch(e) {}
 }
 
