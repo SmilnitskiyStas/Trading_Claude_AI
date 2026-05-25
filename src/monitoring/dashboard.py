@@ -614,12 +614,19 @@ _HTML = """<!DOCTYPE html>
   .stats-item .si-info { color: #8b949e; margin-top: 2px; }
 
   /* ── Signal log ──────────────────────────────────────────── */
-  .sig-panel { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 16px 20px; }
+  .sig-panel  { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 16px 20px; }
   .sig-buy    { color: #3fb950; font-weight: 600; }
   .sig-sell   { color: #f85149; font-weight: 600; }
   .sig-hold   { color: #8b949e; }
   .sig-dis    { color: #484f58; font-style: italic; }
   .sig-reason { font-size: .70rem; color: #d29922; }
+  .sig-filter {
+    padding: 4px 12px; border-radius: 20px; border: 1px solid #30363d;
+    background: #0d1117; color: #8b949e; font-size: .75rem; cursor: pointer;
+    transition: .15s;
+  }
+  .sig-filter:hover  { border-color: #58a6ff; color: #58a6ff; }
+  .sig-filter.active { background: #1f6feb; border-color: #1f6feb; color: #fff; font-weight: 600; }
 
   /* ── Chart ───────────────────────────────────────────────── */
   .chart-panel { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 16px 20px; }
@@ -735,9 +742,18 @@ docker cp trading_postgres:/tmp/ohlcv.csv ohlcv.csv</code>
 
   <!-- Signal Activity Log -->
   <div class="sig-panel">
-    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px">
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;flex-wrap:wrap;gap:8px">
       <div class="section-title" style="margin-bottom:0">&#x1F4E1; Signal Activity</div>
       <span id="sig-count" style="font-size:.72rem;color:#8b949e"></span>
+    </div>
+    <!-- Filter buttons -->
+    <div id="sig-filters" style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:12px">
+      <button class="sig-filter active" data-filter="all"            onclick="setSigFilter(this)">All</button>
+      <button class="sig-filter"        data-filter="ml_buy"         onclick="setSigFilter(this)">ML Buy</button>
+      <button class="sig-filter"        data-filter="ml_sell"        onclick="setSigFilter(this)">ML Sell</button>
+      <button class="sig-filter"        data-filter="agent_disagrees" onclick="setSigFilter(this)">&#x26A0; Agent Blocked</button>
+      <button class="sig-filter"        data-filter="traded"         onclick="setSigFilter(this)">&#x2705; Traded</button>
+      <button class="sig-filter"        data-filter="risk_halted"    onclick="setSigFilter(this)">&#x26D4; Risk Halt</button>
     </div>
     <table id="sig-table">
       <thead><tr>
@@ -1166,32 +1182,67 @@ const REASON_LABEL = {
   'agent_disagrees':  'agent disagrees',
 };
 
+let _sigFilter  = 'all';
+let _allSignals = [];
+
+function setSigFilter(btn) {
+  _sigFilter = btn.dataset.filter;
+  document.querySelectorAll('.sig-filter').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+  renderSignals();
+}
+
+function applyFilter(sigs) {
+  switch (_sigFilter) {
+    case 'ml_buy':          return sigs.filter(s => s.ml_action === 'buy');
+    case 'ml_sell':         return sigs.filter(s => s.ml_action === 'sell');
+    case 'agent_disagrees': return sigs.filter(s => s.blocked_reason === 'agent_disagrees');
+    case 'traded':          return sigs.filter(s => s.final_action === 'buy' || s.final_action === 'sell');
+    case 'risk_halted':     return sigs.filter(s => s.blocked_reason === 'risk_halted');
+    default:                return sigs;
+  }
+}
+
+function renderSignals() {
+  const tb  = document.getElementById('sig-body');
+  const cnt = document.getElementById('sig-count');
+  const filtered = applyFilter(_allSignals);
+
+  if (!_allSignals.length) {
+    cnt.textContent = '';
+    tb.innerHTML = '<tr><td colspan="7" style="color:#8b949e;padding:14px">No signals yet — trader not running or first cycle pending</td></tr>';
+    return;
+  }
+  cnt.textContent = filtered.length + ' / ' + _allSignals.length + ' entries';
+  if (!filtered.length) {
+    tb.innerHTML = '<tr><td colspan="7" style="color:#8b949e;padding:14px">No signals match this filter</td></tr>';
+    return;
+  }
+  tb.innerHTML = filtered.slice(0, 60).map(s => {
+    const t      = new Date(s.ts).toLocaleTimeString('en-US', {hour:'2-digit', minute:'2-digit', second:'2-digit'});
+    const reason = REASON_LABEL[s.blocked_reason] || s.blocked_reason || '';
+    const rowBg  = s.blocked_reason === 'agent_disagrees'
+                   ? 'background:rgba(210,153,34,.07)'
+                   : (s.final_action === 'buy' || s.final_action === 'sell')
+                   ? 'background:rgba(63,185,80,.05)' : '';
+    return `<tr style="${rowBg}">
+      <td style="font-size:.72rem;color:#8b949e;white-space:nowrap">${t}</td>
+      <td><b>${s.symbol}</b></td>
+      <td class="${sigClass(s.ml_action)}">${sigLabel(s.ml_action)}</td>
+      <td style="color:#8b949e">${s.ml_confidence}%</td>
+      <td class="${sigClass(s.agent_action)}">${sigLabel(s.agent_action)}</td>
+      <td class="${sigClass(s.final_action)}" style="font-weight:700">${sigLabel(s.final_action)}</td>
+      <td class="sig-reason">${reason}</td>
+    </tr>`;
+  }).join('');
+}
+
 async function loadSignals() {
   try {
     const r = await fetch('/api/signals');
     const d = await r.json();
-    const sigs = (d.signals || []).slice().reverse();   // newest first
-    const cnt  = document.getElementById('sig-count');
-    const tb   = document.getElementById('sig-body');
-    if (!sigs.length) {
-      cnt.textContent = '';
-      tb.innerHTML = '<tr><td colspan="7" style="color:#8b949e;padding:14px">No signals yet — trader not running or first cycle pending</td></tr>';
-      return;
-    }
-    cnt.textContent = sigs.length + ' entries';
-    tb.innerHTML = sigs.slice(0, 60).map(s => {
-      const t   = new Date(s.ts).toLocaleTimeString('en-US', {hour:'2-digit', minute:'2-digit', second:'2-digit'});
-      const reason = REASON_LABEL[s.blocked_reason] || s.blocked_reason || '';
-      return `<tr>
-        <td style="font-size:.72rem;color:#8b949e;white-space:nowrap">${t}</td>
-        <td><b>${s.symbol}</b></td>
-        <td class="${sigClass(s.ml_action)}">${sigLabel(s.ml_action)}</td>
-        <td style="color:#8b949e">${s.ml_confidence}%</td>
-        <td class="${sigClass(s.agent_action)}">${sigLabel(s.agent_action)}</td>
-        <td class="${sigClass(s.final_action)}" style="font-weight:700">${sigLabel(s.final_action)}</td>
-        <td class="sig-reason">${reason}</td>
-      </tr>`;
-    }).join('');
+    _allSignals = (d.signals || []).slice().reverse();   // newest first
+    renderSignals();
   } catch(e) { console.error('signals error:', e); }
 }
 
