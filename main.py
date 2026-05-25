@@ -121,6 +121,7 @@ async def mode_backtest(from_date: str, to_date: str) -> None:
 async def mode_paper_trade() -> None:
     from src.ai_agent.agent import TradingAgent
     from src.models.signals import SignalGenerator
+    from src.monitoring.signal_log import SignalLog
     from src.monitoring.telegram_bot import TelegramBot
     from src.trading.paper_trader import PaperTrader
     from src.utils.database import check_connection, init_db
@@ -137,6 +138,7 @@ async def mode_paper_trade() -> None:
 
     sg = SignalGenerator.from_file()
     trader = PaperTrader(sg)
+    sig_log = SignalLog()
 
     bot: TelegramBot | None = None
     if TELEGRAM_BOT_TOKEN and TELEGRAM_BOT_TOKEN != "your_token":
@@ -154,7 +156,7 @@ async def mode_paper_trade() -> None:
             logger.warning(f"AI agent disabled: {e}")
 
     try:
-        await trader.run_live(bot=bot, agent=agent)
+        await trader.run_live(bot=bot, agent=agent, sig_log=sig_log)
     finally:
         if bot:
             await bot.stop()
@@ -171,6 +173,7 @@ async def mode_all() -> None:
     from src.ai_agent.agent import TradingAgent
     from src.models.signals import SignalGenerator
     from src.monitoring.dashboard import run_dashboard
+    from src.monitoring.signal_log import SignalLog
     from src.monitoring.telegram_bot import TelegramBot
     from src.trading.paper_trader import PaperTrader
     from src.utils.database import check_connection, init_db
@@ -186,6 +189,7 @@ async def mode_all() -> None:
 
     sg = SignalGenerator.from_file()
     trader = PaperTrader(sg)
+    sig_log = SignalLog()
 
     bot: TelegramBot | None = None
     if TELEGRAM_BOT_TOKEN and TELEGRAM_BOT_TOKEN != "your_token":
@@ -204,8 +208,8 @@ async def mode_all() -> None:
 
     try:
         await asyncio.gather(
-            trader.run_live(bot=bot, agent=agent),
-            run_dashboard(trader=trader, agent=agent),
+            trader.run_live(bot=bot, agent=agent, sig_log=sig_log),
+            run_dashboard(trader=trader, agent=agent, signal_log=sig_log),
         )
     finally:
         if bot:

@@ -97,6 +97,8 @@ _LOGIN_PAGE = """<!DOCTYPE html>
 _retrain_running: bool = False
 _retrain_log:     list[str] = []
 
+from src.monitoring.signal_log import SignalLog
+
 if TYPE_CHECKING:
     from src.trading.paper_trader import PaperTrader
     from src.ai_agent.agent import TradingAgent
@@ -132,6 +134,7 @@ _manager = ConnectionManager()
 def create_app(
     trader: "PaperTrader | None" = None,
     agent: "TradingAgent | None" = None,
+    signal_log: SignalLog | None = None,
 ) -> FastAPI:
     app = FastAPI(title="Trading Dashboard", docs_url=None, redoc_url=None)
 
@@ -336,6 +339,14 @@ def create_app(
         except Exception as exc:
             return {"rows": [], "total": 0, "error": str(exc)}
 
+    # ── Signal activity log ────────────────────────────────────────────────
+
+    @app.get("/api/signals")
+    async def api_signals() -> dict:
+        if signal_log is None:
+            return {"signals": []}
+        return {"signals": signal_log.recent(100)}
+
     # ── AI Agent toggle ────────────────────────────────────────────────────
 
     @app.get("/api/agent")
@@ -499,8 +510,9 @@ async def _run_retrain() -> None:
 async def run_dashboard(
     trader: "PaperTrader | None" = None,
     agent: "TradingAgent | None" = None,
+    signal_log: SignalLog | None = None,
 ) -> None:
-    app = create_app(trader, agent)
+    app = create_app(trader, agent, signal_log)
     config = uvicorn.Config(
         app,
         host=DASHBOARD_HOST,
@@ -600,6 +612,14 @@ _HTML = """<!DOCTYPE html>
                 padding: 8px 12px; font-size: .75rem; }
   .stats-item .si-sym  { font-weight: 600; color: #c9d1d9; }
   .stats-item .si-info { color: #8b949e; margin-top: 2px; }
+
+  /* ── Signal log ──────────────────────────────────────────── */
+  .sig-panel { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 16px 20px; }
+  .sig-buy    { color: #3fb950; font-weight: 600; }
+  .sig-sell   { color: #f85149; font-weight: 600; }
+  .sig-hold   { color: #8b949e; }
+  .sig-dis    { color: #484f58; font-style: italic; }
+  .sig-reason { font-size: .70rem; color: #d29922; }
 
   /* ── Chart ───────────────────────────────────────────────── */
   .chart-panel { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 16px 20px; }
@@ -711,6 +731,24 @@ docker cp trading_postgres:/tmp/ohlcv.csv ohlcv.csv</code>
                 border-radius:6px;padding:10px 12px;font-size:.72rem;font-family:monospace;
                 color:#8b949e;max-height:160px;overflow-y:auto;white-space:pre-wrap">
     </div>
+  </div>
+
+  <!-- Signal Activity Log -->
+  <div class="sig-panel">
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px">
+      <div class="section-title" style="margin-bottom:0">&#x1F4E1; Signal Activity</div>
+      <span id="sig-count" style="font-size:.72rem;color:#8b949e"></span>
+    </div>
+    <table id="sig-table">
+      <thead><tr>
+        <th>Time</th><th>Symbol</th>
+        <th>ML Signal</th><th>Confidence</th>
+        <th>Agent</th><th>Final</th><th>Blocked by</th>
+      </tr></thead>
+      <tbody id="sig-body">
+        <tr><td colspan="7" style="color:#8b949e;padding:14px">Waiting for signals...</td></tr>
+      </tbody>
+    </table>
   </div>
 
   <!-- Equity Curve Chart -->
@@ -1110,13 +1148,62 @@ function connect() {
   setInterval(() => { if (ws.readyState === 1) ws.send('ping'); }, 20000);
 }
 
+// ── Signal log ────────────────────────────────────────────────────────────
+function sigClass(action) {
+  if (action === 'buy')  return 'sig-buy';
+  if (action === 'sell') return 'sig-sell';
+  if (action === 'disabled' || action === '—') return 'sig-dis';
+  return 'sig-hold';
+}
+function sigLabel(action) {
+  if (action === 'disabled') return '— n/a —';
+  return action ? action.toUpperCase() : '—';
+}
+const REASON_LABEL = {
+  '':                 '',
+  'position_exists':  'in position',
+  'risk_halted':      'risk halt',
+  'agent_disagrees':  'agent disagrees',
+};
+
+async function loadSignals() {
+  try {
+    const r = await fetch('/api/signals');
+    const d = await r.json();
+    const sigs = (d.signals || []).slice().reverse();   // newest first
+    const cnt  = document.getElementById('sig-count');
+    const tb   = document.getElementById('sig-body');
+    if (!sigs.length) {
+      cnt.textContent = '';
+      tb.innerHTML = '<tr><td colspan="7" style="color:#8b949e;padding:14px">No signals yet — trader not running or first cycle pending</td></tr>';
+      return;
+    }
+    cnt.textContent = sigs.length + ' entries';
+    tb.innerHTML = sigs.slice(0, 60).map(s => {
+      const t   = new Date(s.ts).toLocaleTimeString('en-US', {hour:'2-digit', minute:'2-digit', second:'2-digit'});
+      const reason = REASON_LABEL[s.blocked_reason] || s.blocked_reason || '';
+      return `<tr>
+        <td style="font-size:.72rem;color:#8b949e;white-space:nowrap">${t}</td>
+        <td><b>${s.symbol}</b></td>
+        <td class="${sigClass(s.ml_action)}">${sigLabel(s.ml_action)}</td>
+        <td style="color:#8b949e">${s.ml_confidence}%</td>
+        <td class="${sigClass(s.agent_action)}">${sigLabel(s.agent_action)}</td>
+        <td class="${sigClass(s.final_action)}" style="font-weight:700">${sigLabel(s.final_action)}</td>
+        <td class="sig-reason">${reason}</td>
+      </tr>`;
+    }).join('');
+  } catch(e) { console.error('signals error:', e); }
+}
+
 // ── Init ───────────────────────────────────────────────────────────────────
 fetch('/api/status').then(r => r.json()).then(applyStatus).catch(console.error);
 loadTrades();
 loadStats();
 loadDbStats();
+loadSignals();
 setInterval(loadTrades,  15000);   // trades table every 15s
 setInterval(loadStats,   30000);   // stats + chart every 30s
+setInterval(loadSignals, 10000);   // signal log every 10s
 connect();
 </script>
 </body>

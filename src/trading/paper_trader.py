@@ -9,6 +9,7 @@ import pandas as pd
 
 from src.models.signals import SignalGenerator
 from src.monitoring.metrics import PerformanceMetrics, calculate_metrics
+from src.monitoring.signal_log import SignalEntry, SignalLog
 from src.strategy.risk_manager import RiskManager
 from src.utils.config import INITIAL_BALANCE, PAPER_TRADING, PRIMARY_EXCHANGE, SYMBOLS
 from src.utils.database import get_session, PortfolioSnapshot
@@ -152,6 +153,7 @@ class PaperTrader:
         poll_interval_seconds: int = 60,
         bot: "TelegramBot | None" = None,
         agent: "TradingAgent | None" = None,
+        sig_log: SignalLog | None = None,
     ) -> None:
         """
         Live paper-trading loop. Runs indefinitely until cancelled.
@@ -197,18 +199,44 @@ class PaperTrader:
                 elif agent and not agent.enabled:
                     _agent_signals = {}   # clear overrides when disabled
 
+                _now = datetime.now(timezone.utc)
                 for sym in active:
+                    ml_sig = ml_signals.get(sym, {})
+                    ml_action = ml_sig.get("action", "hold")
+                    ml_conf   = ml_sig.get("confidence", 0.0)
+
                     # Always check SL/TP on existing positions (even when halted)
                     if sym in self._positions:
                         await self._check_live_sl_tp(sym, bot=bot)
+                        if sig_log:
+                            sig_log.append(SignalEntry(
+                                ts=_now, symbol=sym,
+                                ml_action=ml_action, ml_confidence=ml_conf,
+                                agent_action="disabled",
+                                final_action="hold",
+                                blocked_reason="position_exists",
+                            ))
                         continue
+
                     if self.rm.is_halted:
                         logger.warning("Risk manager halted — skipping new signals")
+                        if sig_log:
+                            sig_log.append(SignalEntry(
+                                ts=_now, symbol=sym,
+                                ml_action=ml_action, ml_confidence=ml_conf,
+                                agent_action="disabled",
+                                final_action="hold",
+                                blocked_reason="risk_halted",
+                            ))
                         break
 
                     # Merge: agent overrides ML only when it disagrees with "hold"
-                    final_sig = dict(ml_signals[sym])
-                    agent_dec = _agent_signals.get(sym, {})
+                    final_sig    = dict(ml_sig)
+                    agent_dec    = _agent_signals.get(sym, {})
+                    agent_enabled = agent is not None and agent.enabled
+                    agent_action  = agent_dec.get("action", "—") if agent_enabled else "disabled"
+                    blocked_reason = ""
+
                     if agent_dec.get("action") in ("buy", "sell"):
                         # Only act if both ML and agent agree on direction
                         if agent_dec["action"] == final_sig.get("action"):
@@ -221,9 +249,21 @@ class PaperTrader:
                             # Disagree → stay conservative (hold)
                             final_sig["action"] = "hold"
                             final_sig["signal"] = 0
+                            blocked_reason = "agent_disagrees"
 
-                    if final_sig.get("action") in ("buy", "sell"):
+                    final_action = final_sig.get("action", "hold")
+
+                    if final_action in ("buy", "sell"):
                         await self._open_live_position(sym, final_sig, bot=bot)
+
+                    if sig_log:
+                        sig_log.append(SignalEntry(
+                            ts=_now, symbol=sym,
+                            ml_action=ml_action, ml_confidence=ml_conf,
+                            agent_action=agent_action,
+                            final_action=final_action,
+                            blocked_reason=blocked_reason,
+                        ))
 
                 await self._save_snapshot()
                 await asyncio.sleep(poll_interval_seconds)
