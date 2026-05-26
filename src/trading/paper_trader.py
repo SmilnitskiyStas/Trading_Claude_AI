@@ -201,9 +201,13 @@ class PaperTrader:
 
                 _now = datetime.now(timezone.utc)
                 for sym in active:
-                    ml_sig = ml_signals.get(sym, {})
+                    ml_sig  = ml_signals.get(sym, {})
                     ml_action = ml_sig.get("action", "hold")
                     ml_conf   = ml_sig.get("confidence", 0.0)
+                    probas    = ml_sig.get("probabilities", {})
+                    p_buy  = probas.get("buy",  0.0)
+                    p_hold = probas.get("hold", 0.0)
+                    p_sell = probas.get("sell", 0.0)
 
                     # Always check SL/TP on existing positions (even when halted)
                     if sym in self._positions:
@@ -212,6 +216,7 @@ class PaperTrader:
                             sig_log.append(SignalEntry(
                                 ts=_now, symbol=sym,
                                 ml_action=ml_action, ml_confidence=ml_conf,
+                                p_buy=p_buy, p_hold=p_hold, p_sell=p_sell,
                                 agent_action="disabled",
                                 final_action="hold",
                                 blocked_reason="position_exists",
@@ -224,6 +229,7 @@ class PaperTrader:
                             sig_log.append(SignalEntry(
                                 ts=_now, symbol=sym,
                                 ml_action=ml_action, ml_confidence=ml_conf,
+                                p_buy=p_buy, p_hold=p_hold, p_sell=p_sell,
                                 agent_action="disabled",
                                 final_action="hold",
                                 blocked_reason="risk_halted",
@@ -260,6 +266,7 @@ class PaperTrader:
                         sig_log.append(SignalEntry(
                             ts=_now, symbol=sym,
                             ml_action=ml_action, ml_confidence=ml_conf,
+                            p_buy=p_buy, p_hold=p_hold, p_sell=p_sell,
                             agent_action=agent_action,
                             final_action=final_action,
                             blocked_reason=blocked_reason,

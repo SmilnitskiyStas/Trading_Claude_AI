@@ -758,7 +758,7 @@ docker cp trading_postgres:/tmp/ohlcv.csv ohlcv.csv</code>
     <table id="sig-table">
       <thead><tr>
         <th>Time</th><th>Symbol</th>
-        <th>ML Signal</th><th>Confidence</th>
+        <th>ML Signal</th><th>P(buy) / P(hold) / P(sell)</th>
         <th>Agent</th><th>Final</th><th>Blocked by</th>
       </tr></thead>
       <tbody id="sig-body">
@@ -1225,11 +1225,19 @@ function renderSignals() {
                    ? 'background:rgba(210,153,34,.07)'
                    : (s.final_action === 'buy' || s.final_action === 'sell')
                    ? 'background:rgba(63,185,80,.05)' : '';
+    const pBuy  = s.p_buy  ?? 0;
+    const pHold = s.p_hold ?? 0;
+    const pSell = s.p_sell ?? 0;
+    const probBar = `<span style="color:#3fb950">${pBuy}%</span>`
+                  + `<span style="color:#484f58;margin:0 3px">/</span>`
+                  + `<span style="color:#8b949e">${pHold}%</span>`
+                  + `<span style="color:#484f58;margin:0 3px">/</span>`
+                  + `<span style="color:#f85149">${pSell}%</span>`;
     return `<tr style="${rowBg}">
       <td style="font-size:.72rem;color:#8b949e;white-space:nowrap">${t}</td>
       <td><b>${s.symbol}</b></td>
       <td class="${sigClass(s.ml_action)}">${sigLabel(s.ml_action)}</td>
-      <td style="color:#8b949e">${s.ml_confidence}%</td>
+      <td style="font-size:.78rem;font-family:monospace">${probBar}</td>
       <td class="${sigClass(s.agent_action)}">${sigLabel(s.agent_action)}</td>
       <td class="${sigClass(s.final_action)}" style="font-weight:700">${sigLabel(s.final_action)}</td>
       <td class="sig-reason">${reason}</td>

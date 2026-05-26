@@ -11,8 +11,8 @@ PROCESSED_DIR = Path("data/processed")
 PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
 
 # ML target parameters
-TARGET_HORIZON = 4      # candles ahead
-TARGET_THRESHOLD = 0.01  # 1% move = signal
+TARGET_HORIZON = 4       # candles ahead
+TARGET_THRESHOLD = 0.005  # 0.5% move = signal (was 1% — too strict for current market)
 
 
 class FeatureProcessor:
